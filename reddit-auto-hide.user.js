@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Auto-Hide Seen Posts
 // @namespace    https://github.com/npezarro/scripts
-// @version      2.2
+// @version      2.4
 // @description  Automatically hides Reddit posts after you scroll past them. Toggle to reveal hidden posts. Syncs across devices via Reddit's native hide API.
 // @author       npezarro
 // @match        *://*.reddit.com/*
@@ -147,6 +147,43 @@
     pageWarn('[AutoHide] Failed to install auth interceptors: ' + e.message);
   }
 
+  // --- Proactively trigger an auth-bearing request if none captured after init ---
+  function probeForAuth() {
+    if (capturedHeaders) return;
+    // Make a lightweight Reddit API call that forces the page's fetch interceptor
+    // to fire with auth headers. /api/me is small and always works when logged in.
+    try {
+      unsafeWindow.fetch('https://www.reddit.com/svc/shreddit/graphql', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'me' }),
+      }).catch(() => {});
+      pageLog('[AutoHide] Probed for auth via graphql endpoint');
+    } catch(e) {}
+    // Also try reading the access token from Reddit's config if available
+    try {
+      const cfg = unsafeWindow.__r;
+      if (cfg && cfg.config && cfg.config.accessToken) {
+        captureAuth({ 'authorization': `Bearer ${cfg.config.accessToken}` });
+        return;
+      }
+    } catch(e) {}
+    try {
+      // shreddit stores token in a meta tag or script
+      const scripts = document.querySelectorAll('script');
+      for (const s of scripts) {
+        const text = s.textContent;
+        if (text && text.includes('accessToken')) {
+          const match = text.match(/"accessToken"\s*:\s*"([^"]+)"/);
+          if (match) {
+            captureAuth({ 'authorization': `Bearer ${match[1]}` });
+            return;
+          }
+        }
+      }
+    } catch(e) {}
+  }
+
   function getCapturedHeaders() {
     return capturedHeaders;
   }
@@ -242,18 +279,21 @@
 
   // --- Find scrollable ancestor (mobile Reddit uses a nested scroll container) ---
   function findScrollRoot() {
-    // Walk up from the first post to find the scrolling ancestor
     const firstPost = document.querySelector('shreddit-post, article[data-testid="post-container"], #siteTable > .thing.link');
     if (!firstPost) return null;
     let el = firstPost.parentElement;
+    const candidates = [];
     while (el && el !== document.body && el !== document.documentElement) {
       const style = getComputedStyle(el);
       const overflow = style.overflowY;
-      if ((overflow === 'auto' || overflow === 'scroll') && el.scrollHeight > el.clientHeight) {
+      candidates.push(`<${el.tagName.toLowerCase()}> overflow-y=${overflow} scrollH=${el.scrollHeight} clientH=${el.clientHeight}`);
+      if ((overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay') && el.scrollHeight > el.clientHeight) {
         return el;
       }
       el = el.parentElement;
     }
+    // Log all ancestors so we can diagnose
+    pageLog(`[AutoHide] No scroll container found. Ancestors: ${candidates.join(' → ')}`);
     return null; // viewport is the scroll root
   }
 
@@ -266,6 +306,14 @@
       pageLog(`[AutoHide] Using scroll container: <${scrollRoot.tagName.toLowerCase()}> class="${(scrollRoot.className || '').toString().slice(0, 60)}"`);
     }
 
+    // Debug: log what posts are found and how they're structured
+    const debugPosts = getPostElements();
+    pageLog(`[AutoHide] Debug: ${debugPosts.length} posts found, tags: ${Array.from(new Set(Array.from(debugPosts).map(p => p.tagName))).join(',')}`);
+    if (debugPosts.length > 0) {
+      const p = debugPosts[0];
+      pageLog(`[AutoHide] Debug: first post tag=${p.tagName} id=${p.id || '(none)'} class=${(p.className||'').toString().slice(0,80)}`);
+    }
+
     observer = new IntersectionObserver((entries) => {
       if (!enabled || showHidden) return;
 
@@ -274,6 +322,9 @@
         if (!postId) continue;
 
         if (entry.isIntersecting) {
+          if (!seenInViewport.has(postId)) {
+            pageLog(`[AutoHide] Seen: ${postId}`);
+          }
           seenInViewport.add(postId);
           if (seenTimers.has(postId)) {
             clearTimeout(seenTimers.get(postId));
@@ -281,9 +332,8 @@
           }
         } else {
           if (seenInViewport.has(postId) && !fadedPosts.has(postId) && !seenTimers.has(postId)) {
-            // Use the entry's boundingClientRect which is relative to the
-            // observer root — works for both viewport and nested scroll containers.
             const rect = entry.boundingClientRect;
+            pageLog(`[AutoHide] Left viewport: ${postId} rect.bottom=${Math.round(rect.bottom)} rootTop=${scrollRoot ? Math.round(scrollRoot.getBoundingClientRect().top) : 'viewport'}`);
             if (rect.bottom < 0 || (scrollRoot && rect.bottom < scrollRoot.getBoundingClientRect().top)) {
               const el = entry.target;
               seenTimers.set(postId, setTimeout(() => {
@@ -312,6 +362,49 @@
         post.dataset.autoHideObserved = 'true';
       }
     });
+  }
+
+  // --- Scroll-based fallback for mobile browsers where IntersectionObserver
+  //     may not fire exit events reliably (e.g. Firefox Android) ---
+  let scrollFallbackTimer = null;
+  function setupScrollFallback() {
+    const scrollTarget = window;
+    let lastCheck = 0;
+
+    function checkScrolledPast() {
+      if (!enabled || showHidden) return;
+      const now = Date.now();
+      if (now - lastCheck < 300) return; // throttle to ~3Hz
+      lastCheck = now;
+
+      const posts = getPostElements();
+      posts.forEach(post => {
+        const postId = getPostId(post);
+        if (!postId || fadedPosts.has(postId)) return;
+
+        const rect = post.getBoundingClientRect();
+        // Post is fully above the viewport
+        if (rect.bottom < 0) {
+          if (!seenTimers.has(postId)) {
+            seenInViewport.add(postId); // ensure it's marked seen
+            seenTimers.set(postId, setTimeout(() => {
+              seenTimers.delete(postId);
+              fadePost(postId, post);
+            }, SCROLL_PAST_DELAY_MS));
+          }
+        } else if (rect.top < window.innerHeight && rect.bottom > 0) {
+          // Post is in viewport — mark as seen, cancel any pending fade
+          seenInViewport.add(postId);
+          if (seenTimers.has(postId)) {
+            clearTimeout(seenTimers.get(postId));
+            seenTimers.delete(postId);
+          }
+        }
+      });
+    }
+
+    scrollTarget.addEventListener('scroll', checkScrolledPast, { passive: true });
+    pageLog('[AutoHide] Scroll fallback listener installed');
   }
 
   // --- Watch for dynamically loaded posts (infinite scroll) ---
@@ -523,11 +616,16 @@
     if (!isFeedPage()) return;
 
     const posts = getPostElements();
-    pageLog(`[AutoHide] v2.2 init on ${location.href} — ${posts.length} posts, enabled=${enabled}`);
+    pageLog(`[AutoHide] v2.4 init on ${location.href} — ${posts.length} posts, enabled=${enabled}`);
     createToggleUI();
     setupObserver();
+    setupScrollFallback();
     setupMutationObserver();
     startBatchProcessor();
+    // Try to capture auth immediately — on mobile, Reddit may not make
+    // authenticated requests until user interaction
+    setTimeout(probeForAuth, 1000);
+    setTimeout(probeForAuth, 5000);
 
     let lastUrl = location.href;
     const navObserver = new MutationObserver(() => {
