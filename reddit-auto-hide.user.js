@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Auto-Hide Seen Posts
 // @namespace    https://github.com/npezarro/scripts
-// @version      2.1
+// @version      2.2
 // @description  Automatically hides Reddit posts after you scroll past them. Toggle to reveal hidden posts. Syncs across devices via Reddit's native hide API.
 // @author       npezarro
 // @match        *://*.reddit.com/*
@@ -82,72 +82,73 @@
   }
 
   // --- Steal Reddit's auth by intercepting fetch AND XHR ---
-  const captureScript = document.createElement('script');
-  captureScript.textContent = `(function() {
-    window.__redditAuthHeaders = null;
+  // Use unsafeWindow directly (works in all Tampermonkey environments including
+  // Firefox Android) instead of injecting a <script> tag which can be blocked by CSP.
+  let capturedHeaders = null;
 
-    // Intercept fetch
-    var origFetch = window.fetch;
-    window.fetch = function(input, init) {
-      var url = typeof input === 'string' ? input : (input && input.url) || '';
+  function captureAuth(headers) {
+    capturedHeaders = headers;
+    pageLog('[AutoHide] Captured auth: ' + Object.keys(headers).join(', '));
+  }
+
+  function extractHeaders(h) {
+    if (!h) return null;
+    const captured = {};
+    try {
+      if (h instanceof unsafeWindow.Headers || (h.forEach && h.get)) {
+        h.forEach(function(v, k) { captured[k.toLowerCase()] = v; });
+      } else if (typeof h === 'object' && !Array.isArray(h)) {
+        for (const k in h) { if (h.hasOwnProperty(k)) captured[k.toLowerCase()] = h[k]; }
+      }
+    } catch(e) {}
+    return captured['authorization'] ? captured : null;
+  }
+
+  try {
+    const win = unsafeWindow;
+
+    // Intercept fetch — handles both fetch(url, {headers}) and fetch(Request)
+    const origFetch = win.fetch.bind(win);
+    win.fetch = function(input, init) {
       try {
-        var h = init && init.headers;
-        if (h) {
-          var captured = {};
-          if (h instanceof Headers) {
-            h.forEach(function(v, k) { captured[k.toLowerCase()] = v; });
-          } else if (typeof h === 'object') {
-            for (var k in h) { if (h.hasOwnProperty(k)) captured[k.toLowerCase()] = h[k]; }
-          }
-          if (captured['authorization']) {
-            window.__redditAuthHeaders = captured;
-            window.dispatchEvent(new CustomEvent('__redditAuth', { detail: captured }));
-          }
+        // Check init.headers first (most common)
+        let found = extractHeaders(init && init.headers);
+        // Also check if input is a Request object with headers
+        if (!found && input && typeof input === 'object' && input.headers) {
+          found = extractHeaders(input.headers);
         }
+        if (found) captureAuth(found);
       } catch(e) {}
-      return origFetch.apply(this, arguments);
+      return origFetch.apply(win, arguments);
     };
 
     // Intercept XHR
-    var origOpen = XMLHttpRequest.prototype.open;
-    var origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
-    var origSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function(method, url) {
-      this.__url = url;
-      this.__headers = {};
+    const origOpen = win.XMLHttpRequest.prototype.open;
+    const origSetHeader = win.XMLHttpRequest.prototype.setRequestHeader;
+    const origSend = win.XMLHttpRequest.prototype.send;
+
+    win.XMLHttpRequest.prototype.open = function(method, url) {
+      this.__ahHeaders = {};
       return origOpen.apply(this, arguments);
     };
-    XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
-      this.__headers[name.toLowerCase()] = value;
+    win.XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+      if (this.__ahHeaders) this.__ahHeaders[name.toLowerCase()] = value;
       return origSetHeader.apply(this, arguments);
     };
-    XMLHttpRequest.prototype.send = function() {
-      if (this.__headers && this.__headers['authorization']) {
-        window.__redditAuthHeaders = this.__headers;
-        window.dispatchEvent(new CustomEvent('__redditAuth', { detail: this.__headers }));
+    win.XMLHttpRequest.prototype.send = function() {
+      if (this.__ahHeaders && this.__ahHeaders['authorization']) {
+        captureAuth(this.__ahHeaders);
       }
       return origSend.apply(this, arguments);
     };
-  })();`;
-  (document.head || document.documentElement).prepend(captureScript);
-  captureScript.remove();
 
-  // Listen for captured auth
-  let capturedHeaders = null;
-  window.addEventListener('__redditAuth', (e) => {
-    capturedHeaders = e.detail;
-    pageLog('[AutoHide] Captured auth: ' + Object.keys(capturedHeaders).join(', '));
-  });
+    pageLog('[AutoHide] Auth interceptors installed via unsafeWindow');
+  } catch(e) {
+    pageWarn('[AutoHide] Failed to install auth interceptors: ' + e.message);
+  }
 
   function getCapturedHeaders() {
-    if (capturedHeaders) return capturedHeaders;
-    try {
-      if (unsafeWindow.__redditAuthHeaders) {
-        capturedHeaders = unsafeWindow.__redditAuthHeaders;
-        return capturedHeaders;
-      }
-    } catch {}
-    return null;
+    return capturedHeaders;
   }
 
   // --- Reddit API: hide/unhide via GM_xmlhttpRequest (bypasses CORS) ---
@@ -522,7 +523,7 @@
     if (!isFeedPage()) return;
 
     const posts = getPostElements();
-    pageLog(`[AutoHide] v2.1 init on ${location.href} — ${posts.length} posts, enabled=${enabled}`);
+    pageLog(`[AutoHide] v2.2 init on ${location.href} — ${posts.length} posts, enabled=${enabled}`);
     createToggleUI();
     setupObserver();
     setupMutationObserver();
