@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Auto-Hide Seen Posts
 // @namespace    https://github.com/npezarro/scripts
-// @version      2.0
+// @version      2.1
 // @description  Automatically hides Reddit posts after you scroll past them. Toggle to reveal hidden posts. Syncs across devices via Reddit's native hide API.
 // @author       npezarro
 // @match        *://*.reddit.com/*
@@ -239,9 +239,31 @@
     }, HIDE_BATCH_INTERVAL_MS);
   }
 
+  // --- Find scrollable ancestor (mobile Reddit uses a nested scroll container) ---
+  function findScrollRoot() {
+    // Walk up from the first post to find the scrolling ancestor
+    const firstPost = document.querySelector('shreddit-post, article[data-testid="post-container"], #siteTable > .thing.link');
+    if (!firstPost) return null;
+    let el = firstPost.parentElement;
+    while (el && el !== document.body && el !== document.documentElement) {
+      const style = getComputedStyle(el);
+      const overflow = style.overflowY;
+      if ((overflow === 'auto' || overflow === 'scroll') && el.scrollHeight > el.clientHeight) {
+        return el;
+      }
+      el = el.parentElement;
+    }
+    return null; // viewport is the scroll root
+  }
+
   // --- IntersectionObserver: detect scrolled-past posts ---
   function setupObserver() {
     if (observer) observer.disconnect();
+
+    const scrollRoot = findScrollRoot();
+    if (scrollRoot) {
+      pageLog(`[AutoHide] Using scroll container: <${scrollRoot.tagName.toLowerCase()}> class="${(scrollRoot.className || '').toString().slice(0, 60)}"`);
+    }
 
     observer = new IntersectionObserver((entries) => {
       if (!enabled || showHidden) return;
@@ -258,8 +280,10 @@
           }
         } else {
           if (seenInViewport.has(postId) && !fadedPosts.has(postId) && !seenTimers.has(postId)) {
-            const rect = entry.target.getBoundingClientRect();
-            if (rect.bottom < 0) {
+            // Use the entry's boundingClientRect which is relative to the
+            // observer root — works for both viewport and nested scroll containers.
+            const rect = entry.boundingClientRect;
+            if (rect.bottom < 0 || (scrollRoot && rect.bottom < scrollRoot.getBoundingClientRect().top)) {
               const el = entry.target;
               seenTimers.set(postId, setTimeout(() => {
                 seenTimers.delete(postId);
@@ -270,6 +294,7 @@
         }
       }
     }, {
+      root: scrollRoot, // null = viewport (desktop), element = nested container (mobile)
       threshold: [0, 0.1],
       rootMargin: '0px',
     });
@@ -497,7 +522,7 @@
     if (!isFeedPage()) return;
 
     const posts = getPostElements();
-    pageLog(`[AutoHide] v1.4 init on ${location.href} — ${posts.length} posts, enabled=${enabled}`);
+    pageLog(`[AutoHide] v2.1 init on ${location.href} — ${posts.length} posts, enabled=${enabled}`);
     createToggleUI();
     setupObserver();
     setupMutationObserver();
