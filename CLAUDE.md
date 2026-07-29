@@ -15,6 +15,7 @@ literals. A pre-commit hook enforces this; do not `--no-verify` around it.
 | `server.js` | Express app: auth, routing, validation. |
 | `lib/store.js` | JSON-backed hidden-post store: delta queries, tombstones, pruning, atomic writes. |
 | `test/store.test.js` | `node:test` unit tests for the store. |
+| `test/integration.mjs` | Real userscript in Chromium against a real server. Needs `SYNC_BASE` + `SYNC_KEY`. |
 | `ecosystem.config.cjs` | PM2 config. No `cwd` field: start it from the repo directory. |
 
 ## Commands
@@ -24,7 +25,20 @@ npm install
 npm run build   # syntax check (no bundler)
 npm test        # store unit tests, all must pass before commit
 npm start       # server on 127.0.0.1:$PORT
+
+# End-to-end: hide by scrolling, reload, assert still hidden, then cross-device.
+# Run this after ANY change to the ledger, sync, or visual-state code.
+SYNC_BASE=<base> SYNC_KEY=<key> node test/integration.mjs
 ```
+
+The integration test is the only thing that catches the v2.4 class of bug, because
+"hidden posts come back on the next load" looks identical to success from inside a
+single page life. Two traps in its harness, both already handled: Playwright's
+`exposeFunction` is always async while `GM_getValue` is called at module scope (so
+the store is inlined into the init script and only writes go through a binding),
+and the userscript must be injected *after* load rather than via `addInitScript`
+because it declares `@run-at document-idle` (injecting at document-start makes
+`GM_addStyle` throw on a null `document.head`).
 
 ## Architecture: three tiers of persistence
 
