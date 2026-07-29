@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Auto-Hide Seen Posts
 // @namespace    https://github.com/npezarro/scripts
-// @version      3.0
+// @version      3.1
 // @description  Automatically hides Reddit posts after you scroll past them. Keeps a durable local ledger plus an optional authenticated sync server, so hides survive reloads and follow you across devices.
 // @author       npezarro
 // @match        *://*.reddit.com/*
@@ -12,6 +12,7 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
+// @grant        GM_setClipboard
 // @grant        unsafeWindow
 // @connect      oauth.reddit.com
 // @connect      *
@@ -402,6 +403,49 @@
   }
 
   let syncKeyWarned = false;
+
+  /**
+   * One-time provisioning from a link: any Reddit URL with
+   * `#autohide-sync=<base64 of "https://host/base|key">`.
+   * Typing a 64-character key into a mobile Tampermonkey prompt is miserable;
+   * opening a link is not. The fragment is stripped from history immediately.
+   */
+  function consumeSyncLink() {
+    const match = location.hash.match(/[#&]autohide-sync=([^&]+)/);
+    if (!match) return false;
+
+    let decoded = '';
+    try {
+      decoded = unsafeWindow.atob(decodeURIComponent(match[1]));
+    } catch (e) {
+      pageWarn('[AutoHide] Sync link is not valid base64, ignoring');
+      return false;
+    }
+    const sep = decoded.lastIndexOf('|');
+    if (sep < 1) {
+      pageWarn('[AutoHide] Sync link must decode to "<baseUrl>|<key>"');
+      return false;
+    }
+    const base = decoded.slice(0, sep).trim().replace(/\/$/, '');
+    const key = decoded.slice(sep + 1).trim();
+    if (!/^https?:\/\//.test(base) || !key) {
+      pageWarn('[AutoHide] Sync link missing a valid base URL or key');
+      return false;
+    }
+
+    GM_setValue(SYNC_BASE_NAME, base);
+    GM_setValue(SYNC_KEY_NAME, key);
+    syncKeyWarned = false;
+
+    // Do not leave the key sitting in the URL bar or this history entry.
+    try {
+      const clean = location.href.replace(/[#&]autohide-sync=[^&]*/, '');
+      unsafeWindow.history.replaceState(null, '', clean || location.pathname);
+    } catch (e) { /* cosmetic only */ }
+
+    pageLog('[AutoHide] Sync configured from link: ' + base);
+    return true;
+  }
 
   function syncEnabled() {
     if (syncKey() && syncBase()) return true;
@@ -906,6 +950,21 @@
       unsafeWindow.alert(`Sync connected to ${cleanBase}.\n${hiddenCount()} hidden posts known on this device.`);
     });
 
+    GM_registerMenuCommand('Auto-Hide: setup link for another device', () => {
+      if (!syncBase() || !syncKey()) {
+        unsafeWindow.alert('Configure sync on this device first.');
+        return;
+      }
+      const payload = unsafeWindow.btoa(`${syncBase()}|${syncKey()}`);
+      const link = `https://www.reddit.com/#autohide-sync=${encodeURIComponent(payload)}`;
+      try {
+        GM_setClipboard(link);
+        unsafeWindow.alert('Setup link copied to the clipboard.\n\nOpen it on another device that has this script installed. It configures sync and removes itself from the URL.\n\nIt contains your key: send it privately.');
+      } catch (e) {
+        unsafeWindow.prompt('Open this on the other device (contains your key, send it privately):', link);
+      }
+    });
+
     GM_registerMenuCommand('Auto-Hide: sync now', async () => {
       await pushRemote();
       await pullRemote(true);
@@ -967,6 +1026,7 @@
   function init() {
     ledger = loadLedger();
     registerMenu();
+    consumeSyncLink();
 
     // The sync loop runs on every Reddit page, not just feeds: a queue left over
     // from a fast scroll gets flushed even if the next page is a comment thread.
@@ -984,7 +1044,7 @@
     });
 
     feedMode = isFeedPage();
-    pageLog(`[AutoHide] v3.0 init on ${location.href} — feed=${feedMode}, ledger=${hiddenCount()}, ` +
+    pageLog(`[AutoHide] v3.1 init on ${location.href} — feed=${feedMode}, ledger=${hiddenCount()}, ` +
       `queued(remote)=${idsNeeding('remote').length}, queued(reddit)=${idsNeeding('reddit').length}, enabled=${enabled}`);
     if (!feedMode) return;
 
