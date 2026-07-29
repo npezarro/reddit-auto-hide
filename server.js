@@ -30,6 +30,14 @@ if (process.env.NODE_ENV === 'production') app.set('trust proxy', 1);
 app.use(cors({ origin: [/^https:\/\/([a-z0-9-]+\.)?reddit\.com$/], credentials: false }));
 app.use(express.json({ limit: '1mb' }));
 
+// A cached delta response would hand a client a stale cursor and silently lose
+// hides, so nothing here may be stored by a CDN, proxy, or browser.
+app.use((_req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.set('Pragma', 'no-cache');
+  next();
+});
+
 // Apache proxies the full path (ProxyPass /reddit-hide -> :3205), so strip the prefix.
 app.use((req, _res, next) => {
   if (BASE_PATH && req.url.startsWith(BASE_PATH)) {
