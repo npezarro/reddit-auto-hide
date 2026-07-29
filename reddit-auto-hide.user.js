@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Reddit Auto-Hide Seen Posts
 // @namespace    https://github.com/npezarro/scripts
-// @version      2.4
-// @description  Automatically hides Reddit posts after you scroll past them. Toggle to reveal hidden posts. Syncs across devices via Reddit's native hide API.
+// @version      3.0
+// @description  Automatically hides Reddit posts after you scroll past them. Keeps a durable local ledger plus an optional authenticated sync server, so hides survive reloads and follow you across devices.
 // @author       npezarro
 // @match        *://*.reddit.com/*
 // @exclude      *://www.reddit.com/api/*
@@ -14,6 +14,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @connect      oauth.reddit.com
+// @connect      *
 // @run-at       document-idle
 // @updateURL    https://gist.githubusercontent.com/npezarro/a15e7b64beb7c746509be820fa0d07c6/raw/reddit-auto-hide.user.js
 // @downloadURL  https://gist.githubusercontent.com/npezarro/a15e7b64beb7c746509be820fa0d07c6/raw/reddit-auto-hide.user.js
@@ -24,32 +25,156 @@
 
   // --- Config ---
   const SCROLL_PAST_DELAY_MS = 500;
-  const HIDE_BATCH_INTERVAL_MS = 2000;
+  const SYNC_TICK_MS = 2000;          // how often the outbound queues drain
+  const PULL_INTERVAL_MS = 120000;    // how often we pull other devices' hides
+  const REDDIT_BATCH = 5;             // Reddit hide calls per tick (rate-limit friendly)
+  const REMOTE_BATCH = 500;           // ids per sync request (server caps at 500)
+  const MAX_REDDIT_TRIES = 8;         // give up on the native hide, keep hiding locally
+  const RATE_LIMIT_PAUSE_MS = 60000;
+
+  // Sync server is configured per device (Tampermonkey menu -> "Auto-Hide: configure
+  // sync"), never hardcoded here: this file is published for auto-update.
+  const LEDGER_KEY = 'ledgerV3';
+  const SYNC_KEY_NAME = 'syncKey';
+  const SYNC_BASE_NAME = 'syncBase';
+  const LEDGER_MAX_ENTRIES = 20000;
+  const LEDGER_MAX_AGE_MS = 180 * 24 * 60 * 60 * 1000;
 
   // --- State ---
   let enabled = GM_getValue('autoHideEnabled', true);
   let showHidden = false;
-  const pendingHides = new Set();       // post IDs queued for API hide call
-  const seenTimers = new Map();         // postId -> timeout handle
-  const seenInViewport = new Set();     // posts that entered viewport at least once
-  const fadedPosts = new Map();         // postId -> DOM element (locally faded, source of truth for UI)
-  const apiHidden = new Set();          // posts successfully hidden via API
-  let batchInterval = null;
+  let feedMode = false;               // observers/UI only run on feed pages
+  const seenTimers = new Map();       // postId -> timeout handle
+  const seenInViewport = new Set();   // posts that entered the viewport at least once
+  const onPage = new Map();           // postId -> element, for posts we are suppressing
+  const sessionFaded = new Set();     // hidden during THIS page life -> fade, not collapse
   let observer = null;
   let mutationObserver = null;
   let countDisplay = null;
+  let syncInterval = null;
+  let redditRateLimitedUntil = 0;
+  let lastPullAttempt = 0;
+  let pulling = false;
+  let pushing = false;
+
+  // The durable record. `hidden` is what we suppress; `tombs` are unhides still
+  // waiting to be pushed so they do not come back from another device.
+  let ledger = { hidden: {}, tombs: {}, lastPull: 0 };
 
   // --- Logging via page console (visible to browser-logs) ---
   const pageLog = unsafeWindow.console.log.bind(unsafeWindow.console);
   const pageWarn = unsafeWindow.console.warn.bind(unsafeWindow.console);
 
-  // --- Detect Reddit variant ---
+  // ============================================================
+  // Durable ledger
+  // ============================================================
+
+  function loadLedger() {
+    let raw = null;
+    try {
+      raw = JSON.parse(GM_getValue(LEDGER_KEY, 'null'));
+    } catch (e) {
+      pageWarn('[AutoHide] Ledger unreadable, starting fresh: ' + e.message);
+    }
+    const next = { hidden: {}, tombs: {}, lastPull: 0 };
+    if (!raw || typeof raw !== 'object') return next;
+
+    next.lastPull = Number(raw.lastPull) || 0;
+    const cutoff = Date.now() - LEDGER_MAX_AGE_MS;
+    const hidden = raw.hidden && typeof raw.hidden === 'object' ? raw.hidden : {};
+    const ids = Object.keys(hidden)
+      .filter((id) => hidden[id] && Number(hidden[id].t) > cutoff)
+      .sort((a, b) => hidden[b].t - hidden[a].t)
+      .slice(0, LEDGER_MAX_ENTRIES);
+    for (const id of ids) {
+      const e = hidden[id];
+      next.hidden[id] = { t: Number(e.t) || 0, remote: e.remote ? 1 : 0, reddit: e.reddit ? 1 : 0, tries: Number(e.tries) || 0 };
+    }
+    const tombs = raw.tombs && typeof raw.tombs === 'object' ? raw.tombs : {};
+    for (const id of Object.keys(tombs)) {
+      const e = tombs[id];
+      if (e && Number(e.t) > cutoff) next.tombs[id] = { t: Number(e.t) || 0, remote: e.remote ? 1 : 0 };
+    }
+
+    const dropped = Object.keys(hidden).length - ids.length;
+    if (dropped > 0) pageLog(`[AutoHide] Ledger pruned ${dropped} stale entries`);
+    return next;
+  }
+
+  let saveTimer = null;
+
+  function saveLedgerNow() {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+    try {
+      GM_setValue(LEDGER_KEY, JSON.stringify(ledger));
+    } catch (e) {
+      pageWarn('[AutoHide] Ledger save failed: ' + e.message);
+    }
+  }
+
+  function saveLedgerSoon() {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      saveLedgerNow();
+    }, 500);
+  }
+
+  function recordHidden(postId, opts) {
+    const o = opts || {};
+    const existing = ledger.hidden[postId];
+    delete ledger.tombs[postId];
+    ledger.hidden[postId] = {
+      t: existing ? existing.t : Date.now(),
+      remote: o.remote ? 1 : (existing ? existing.remote : 0),
+      reddit: o.reddit ? 1 : (existing ? existing.reddit : 0),
+      tries: existing ? existing.tries : 0,
+    };
+    saveLedgerSoon();
+  }
+
+  function recordUnhidden(postId) {
+    const wasSynced = ledger.hidden[postId] && ledger.hidden[postId].remote;
+    delete ledger.hidden[postId];
+    sessionFaded.delete(postId);
+    // Only tombstone what the server actually knows about; anything never pushed
+    // can just disappear locally.
+    if (wasSynced) ledger.tombs[postId] = { t: Date.now(), remote: 0 };
+    saveLedgerSoon();
+  }
+
+  function idsNeeding(field) {
+    const out = [];
+    for (const id in ledger.hidden) {
+      if (!ledger.hidden[id][field]) out.push(id);
+    }
+    return out;
+  }
+
+  function pendingTombIds() {
+    const out = [];
+    for (const id in ledger.tombs) {
+      if (!ledger.tombs[id].remote) out.push(id);
+    }
+    return out;
+  }
+
+  function hiddenCount() {
+    return Object.keys(ledger.hidden).length;
+  }
+
+  // ============================================================
+  // Reddit DOM
+  // ============================================================
+
   function isOldReddit() {
     return location.hostname === 'old.reddit.com' ||
       document.querySelector('#siteTable') !== null;
   }
 
-  // --- Extract post fullname from DOM element ---
   function getPostId(el) {
     if (el.tagName === 'SHREDDIT-POST') {
       const id = el.getAttribute('id');
@@ -71,7 +196,6 @@
     return null;
   }
 
-  // --- Get all post elements on the page ---
   function getPostElements() {
     if (isOldReddit()) {
       return document.querySelectorAll('#siteTable > .thing.link');
@@ -81,9 +205,74 @@
     return document.querySelectorAll('article[data-testid="post-container"]');
   }
 
-  // --- Steal Reddit's auth by intercepting fetch AND XHR ---
-  // Use unsafeWindow directly (works in all Tampermonkey environments including
-  // Firefox Android) instead of injecting a <script> tag which can be blocked by CSP.
+  // ============================================================
+  // Visual state
+  // ============================================================
+
+  function setVisual(el, mode) {
+    el.classList.remove('ah-collapsed', 'ah-faded');
+    if (mode === 'collapsed') el.classList.add('ah-collapsed');
+    else if (mode === 'faded') el.classList.add('ah-faded');
+  }
+
+  function refreshVisuals() {
+    for (const [id, el] of onPage) {
+      if (!el.isConnected) {
+        onPage.delete(id);
+        continue;
+      }
+      if (showHidden || !ledger.hidden[id]) setVisual(el, 'revealed');
+      else setVisual(el, sessionFaded.has(id) ? 'faded' : 'collapsed');
+    }
+  }
+
+  /**
+   * Suppress any post on the page that the ledger already knows about. Runs on
+   * load and on every infinite-scroll batch, so a hide made on another device
+   * (or in a previous session) takes effect without touching Reddit's API.
+   */
+  function applyLedgerToPosts() {
+    if (!feedMode) return 0;
+    let applied = 0;
+    for (const post of getPostElements()) {
+      const postId = getPostId(post);
+      if (!postId || !ledger.hidden[postId]) continue;
+      if (onPage.get(postId) === post) continue;
+      onPage.set(postId, post);
+      if (!showHidden) setVisual(post, sessionFaded.has(postId) ? 'faded' : 'collapsed');
+      applied++;
+    }
+    if (applied > 0) {
+      pageLog(`[AutoHide] Suppressed ${applied} already-hidden post(s) from ledger`);
+      updateCount();
+    }
+    return applied;
+  }
+
+  function updateCount() {
+    if (!countDisplay) return;
+    const total = hiddenCount();
+    const queued = idsNeeding('remote').length + pendingTombIds().length;
+    countDisplay.textContent = queued > 0 ? `${total} hidden (${queued} syncing)` : `${total} hidden`;
+    const key = GM_getValue(SYNC_KEY_NAME, '');
+    countDisplay.title = key
+      ? `${total} hidden locally, ${queued} awaiting server sync, ${idsNeeding('reddit').length} awaiting Reddit hide`
+      : 'Cross-device sync is OFF. Use the Tampermonkey menu: "Auto-Hide: configure sync".';
+  }
+
+  function fadePost(postId, el) {
+    sessionFaded.add(postId);
+    onPage.set(postId, el);
+    recordHidden(postId);
+    setVisual(el, 'faded');
+    updateCount();
+    pageLog(`[AutoHide] Hid ${postId} (${hiddenCount()} total)`);
+  }
+
+  // ============================================================
+  // Auth capture (Reddit's own bearer token, for the native hide API)
+  // ============================================================
+
   let capturedHeaders = null;
 
   function captureAuth(headers) {
@@ -96,46 +285,42 @@
     const captured = {};
     try {
       if (h instanceof unsafeWindow.Headers || (h.forEach && h.get)) {
-        h.forEach(function(v, k) { captured[k.toLowerCase()] = v; });
+        h.forEach(function (v, k) { captured[k.toLowerCase()] = v; });
       } else if (typeof h === 'object' && !Array.isArray(h)) {
-        for (const k in h) { if (h.hasOwnProperty(k)) captured[k.toLowerCase()] = h[k]; }
+        for (const k in h) { if (Object.prototype.hasOwnProperty.call(h, k)) captured[k.toLowerCase()] = h[k]; }
       }
-    } catch(e) {}
+    } catch (e) { /* not a headers-shaped thing */ }
     return captured['authorization'] ? captured : null;
   }
 
   try {
     const win = unsafeWindow;
 
-    // Intercept fetch — handles both fetch(url, {headers}) and fetch(Request)
     const origFetch = win.fetch.bind(win);
-    win.fetch = function(input, init) {
+    win.fetch = function (input, init) {
       try {
-        // Check init.headers first (most common)
         let found = extractHeaders(init && init.headers);
-        // Also check if input is a Request object with headers
         if (!found && input && typeof input === 'object' && input.headers) {
           found = extractHeaders(input.headers);
         }
         if (found) captureAuth(found);
-      } catch(e) {}
+      } catch (e) { /* never break the page's fetch */ }
       return origFetch.apply(win, arguments);
     };
 
-    // Intercept XHR
     const origOpen = win.XMLHttpRequest.prototype.open;
     const origSetHeader = win.XMLHttpRequest.prototype.setRequestHeader;
     const origSend = win.XMLHttpRequest.prototype.send;
 
-    win.XMLHttpRequest.prototype.open = function(method, url) {
+    win.XMLHttpRequest.prototype.open = function () {
       this.__ahHeaders = {};
       return origOpen.apply(this, arguments);
     };
-    win.XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+    win.XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
       if (this.__ahHeaders) this.__ahHeaders[name.toLowerCase()] = value;
       return origSetHeader.apply(this, arguments);
     };
-    win.XMLHttpRequest.prototype.send = function() {
+    win.XMLHttpRequest.prototype.send = function () {
       if (this.__ahHeaders && this.__ahHeaders['authorization']) {
         captureAuth(this.__ahHeaders);
       }
@@ -143,35 +328,21 @@
     };
 
     pageLog('[AutoHide] Auth interceptors installed via unsafeWindow');
-  } catch(e) {
+  } catch (e) {
     pageWarn('[AutoHide] Failed to install auth interceptors: ' + e.message);
   }
 
-  // --- Proactively trigger an auth-bearing request if none captured after init ---
   function probeForAuth() {
     if (capturedHeaders) return;
-    // Make a lightweight Reddit API call that forces the page's fetch interceptor
-    // to fire with auth headers. /api/me is small and always works when logged in.
-    try {
-      unsafeWindow.fetch('https://www.reddit.com/svc/shreddit/graphql', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: 'me' }),
-      }).catch(() => {});
-      pageLog('[AutoHide] Probed for auth via graphql endpoint');
-    } catch(e) {}
-    // Also try reading the access token from Reddit's config if available
     try {
       const cfg = unsafeWindow.__r;
       if (cfg && cfg.config && cfg.config.accessToken) {
         captureAuth({ 'authorization': `Bearer ${cfg.config.accessToken}` });
         return;
       }
-    } catch(e) {}
+    } catch (e) { /* not old reddit */ }
     try {
-      // shreddit stores token in a meta tag or script
-      const scripts = document.querySelectorAll('script');
-      for (const s of scripts) {
+      for (const s of document.querySelectorAll('script')) {
         const text = s.textContent;
         if (text && text.includes('accessToken')) {
           const match = text.match(/"accessToken"\s*:\s*"([^"]+)"/);
@@ -181,14 +352,21 @@
           }
         }
       }
-    } catch(e) {}
+    } catch (e) { /* no inline token */ }
+    try {
+      unsafeWindow.fetch('https://www.reddit.com/svc/shreddit/graphql', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'me' }),
+      }).catch(() => {});
+      pageLog('[AutoHide] Probed for auth via graphql endpoint');
+    } catch (e) { /* probe is best effort */ }
   }
 
-  function getCapturedHeaders() {
-    return capturedHeaders;
-  }
+  // ============================================================
+  // HTTP
+  // ============================================================
 
-  // --- Reddit API: hide/unhide via GM_xmlhttpRequest (bypasses CORS) ---
   function gmFetch(url, method, headers, body) {
     return new Promise((resolve) => {
       GM_xmlhttpRequest({
@@ -196,88 +374,222 @@
         url,
         headers,
         data: body,
-        timeout: 10000,
+        timeout: 15000,
         onload: (r) => resolve({ ok: r.status >= 200 && r.status < 300, status: r.status, text: r.responseText }),
-        onerror: (e) => resolve({ ok: false, status: 0, text: `Network error: ${e.error || 'unknown'}` }),
+        onerror: (e) => resolve({ ok: false, status: 0, text: `Network error: ${(e && e.error) || 'unknown'}` }),
         ontimeout: () => resolve({ ok: false, status: 0, text: 'Timeout' }),
       });
     });
   }
 
-  async function hidePost(id) {
-    const auth = getCapturedHeaders();
+  // ============================================================
+  // Sync server (cross-device source of truth)
+  // ============================================================
 
-    if (auth && auth['authorization']) {
-      const resp = await gmFetch('https://oauth.reddit.com/api/hide', 'POST', {
-        'Authorization': auth['authorization'],
-        'Content-Type': 'application/x-www-form-urlencoded',
-      }, `id=${id}`);
+  function syncKey() {
+    return GM_getValue(SYNC_KEY_NAME, '');
+  }
 
-      if (resp.ok) {
-        apiHidden.add(id);
-        pageLog(`[AutoHide] Hidden via oauth: ${id}`);
-        return;
+  function syncBase() {
+    return GM_getValue(SYNC_BASE_NAME, '').replace(/\/$/, '');
+  }
+
+  function syncHeaders() {
+    return {
+      'Authorization': `Bearer ${syncKey()}`,
+      'Content-Type': 'application/json',
+    };
+  }
+
+  let syncKeyWarned = false;
+
+  function syncEnabled() {
+    if (syncKey() && syncBase()) return true;
+    if (!syncKeyWarned) {
+      syncKeyWarned = true;
+      pageWarn('[AutoHide] Cross-device sync is off (no endpoint/key). Hides still persist on this device. Tampermonkey menu -> "Auto-Hide: configure sync".');
+    }
+    return false;
+  }
+
+  /** Pull everything other devices changed since our cursor. */
+  async function pullRemote(force) {
+    if (!syncEnabled() || pulling) return;
+    const now = Date.now();
+    if (!force && now - lastPullAttempt < PULL_INTERVAL_MS) return;
+    lastPullAttempt = now;
+    pulling = true;
+    try {
+      let guard = 0;
+      let more = true;
+      let added = 0;
+      let removed = 0;
+      while (more && guard < 20) {
+        guard++;
+        const url = `${syncBase()}/api/hidden?since=${ledger.lastPull}&limit=5000`;
+        const resp = await gmFetch(url, 'GET', syncHeaders());
+        if (!resp.ok) {
+          pageWarn(`[AutoHide] Pull failed (${resp.status}): ${String(resp.text).slice(0, 160)}`);
+          return;
+        }
+        let data;
+        try {
+          data = JSON.parse(resp.text);
+        } catch (e) {
+          pageWarn('[AutoHide] Pull returned non-JSON (proxy or auth page?): ' + String(resp.text).slice(0, 120));
+          return;
+        }
+
+        for (const entry of data.hidden || []) {
+          const id = entry && entry.id;
+          if (!id) continue;
+          // A local unhide we have not pushed yet must win over the server's
+          // older "hidden" row, or the unhide would bounce straight back.
+          const tomb = ledger.tombs[id];
+          if (tomb && !tomb.remote && tomb.t >= Number(entry.t || 0)) continue;
+          if (ledger.hidden[id]) {
+            ledger.hidden[id].remote = 1;
+            continue;
+          }
+          // Already hidden on the device that pushed it, so skip the Reddit call.
+          ledger.hidden[id] = { t: Number(entry.t) || Date.now(), remote: 1, reddit: 1, tries: 0 };
+          added++;
+        }
+
+        for (const id of data.deleted || []) {
+          if (ledger.hidden[id]) {
+            delete ledger.hidden[id];
+            sessionFaded.delete(id);
+            removed++;
+          }
+          delete ledger.tombs[id];
+        }
+
+        ledger.lastPull = Number(data.nextSince) || ledger.lastPull;
+        more = Boolean(data.truncated);
       }
-      pageWarn(`[AutoHide] oauth hide ${resp.status}: ${resp.text.slice(0, 200)}`);
-    } else {
-      pageWarn(`[AutoHide] No auth captured yet for ${id}`);
+
+      saveLedgerNow();
+      if (added || removed) {
+        pageLog(`[AutoHide] Pulled from sync server: +${added} hidden, -${removed} unhidden`);
+        applyLedgerToPosts();
+        refreshVisuals();
+      }
+      updateCount();
+    } finally {
+      pulling = false;
     }
   }
 
-  async function unhidePost(id) {
-    const auth = getCapturedHeaders();
-    if (!auth || !auth['authorization']) return;
+  /** Push local hides and unhides. Nothing is marked synced until the server confirms. */
+  async function pushRemote() {
+    if (!syncEnabled() || pushing) return;
+    pushing = true;
+    try {
+      const toAdd = idsNeeding('remote').slice(0, REMOTE_BATCH);
+      if (toAdd.length) {
+        const resp = await gmFetch(`${syncBase()}/api/hidden`, 'POST', syncHeaders(), JSON.stringify({ ids: toAdd }));
+        if (resp.ok) {
+          for (const id of toAdd) {
+            if (ledger.hidden[id]) ledger.hidden[id].remote = 1;
+          }
+          saveLedgerNow();
+          pageLog(`[AutoHide] Pushed ${toAdd.length} hide(s) to sync server`);
+        } else {
+          pageWarn(`[AutoHide] Push failed (${resp.status}): ${String(resp.text).slice(0, 160)} — will retry`);
+        }
+      }
 
-    const resp = await gmFetch('https://oauth.reddit.com/api/unhide', 'POST', {
+      const toDelete = pendingTombIds().slice(0, REMOTE_BATCH);
+      if (toDelete.length) {
+        const resp = await gmFetch(`${syncBase()}/api/hidden`, 'DELETE', syncHeaders(), JSON.stringify({ ids: toDelete }));
+        if (resp.ok) {
+          for (const id of toDelete) delete ledger.tombs[id];
+          saveLedgerNow();
+          pageLog(`[AutoHide] Pushed ${toDelete.length} unhide(s) to sync server`);
+        } else {
+          pageWarn(`[AutoHide] Unhide push failed (${resp.status}) — will retry`);
+        }
+      }
+      updateCount();
+    } finally {
+      pushing = false;
+    }
+  }
+
+  // ============================================================
+  // Reddit's native hide (best effort, so Reddit's own feed filters too)
+  // ============================================================
+
+  async function redditHide(id) {
+    const auth = capturedHeaders;
+    if (!auth || !auth['authorization']) return { ok: false, status: -1 };
+    return gmFetch('https://oauth.reddit.com/api/hide', 'POST', {
       'Authorization': auth['authorization'],
       'Content-Type': 'application/x-www-form-urlencoded',
     }, `id=${id}`);
+  }
 
-    if (resp.ok) {
-      apiHidden.delete(id);
-      pageLog(`[AutoHide] Unhidden: ${id}`);
-    } else {
-      pageWarn(`[AutoHide] Unhide ${resp.status}: ${id}`);
+  async function redditUnhide(id) {
+    const auth = capturedHeaders;
+    if (!auth || !auth['authorization']) return { ok: false, status: -1 };
+    return gmFetch('https://oauth.reddit.com/api/unhide', 'POST', {
+      'Authorization': auth['authorization'],
+      'Content-Type': 'application/x-www-form-urlencoded',
+    }, `id=${id}`);
+  }
+
+  async function drainRedditQueue() {
+    const queue = idsNeeding('reddit');
+    if (queue.length === 0) return;
+    if (Date.now() < redditRateLimitedUntil) return;
+
+    if (!capturedHeaders || !capturedHeaders['authorization']) {
+      probeForAuth();
+      return; // keep the queue intact; the ledger already hides these locally
     }
-  }
 
-  // --- Update counter display ---
-  function updateCount() {
-    if (countDisplay) {
-      const pending = pendingHides.size;
-      const faded = fadedPosts.size;
-      countDisplay.textContent = pending > 0
-        ? `${faded} hidden (${pending} queued)`
-        : `${faded} hidden`;
-    }
-  }
-
-  // --- Fade a post element ---
-  function fadePost(postId, el) {
-    fadedPosts.set(postId, el);
-    pendingHides.add(postId);
-    el.style.transition = 'opacity 0.3s';
-    el.style.opacity = '0.15';
-    updateCount();
-    pageLog(`[AutoHide] Faded ${postId} (${fadedPosts.size} total)`);
-  }
-
-  // --- Batch processor: send hide API calls ---
-  function startBatchProcessor() {
-    if (batchInterval) return;
-    batchInterval = setInterval(async () => {
-      if (!enabled || pendingHides.size === 0) return;
-      // Process up to 5 per tick to avoid rate limits
-      const batch = Array.from(pendingHides).slice(0, 5);
-      batch.forEach(id => pendingHides.delete(id));
-      for (const id of batch) {
-        await hidePost(id);
+    for (const id of queue.slice(0, REDDIT_BATCH)) {
+      const entry = ledger.hidden[id];
+      if (!entry) continue;
+      const resp = await redditHide(id);
+      if (resp.ok) {
+        entry.reddit = 1;
+        continue;
       }
-      updateCount();
-    }, HIDE_BATCH_INTERVAL_MS);
+      if (resp.status === 429) {
+        redditRateLimitedUntil = Date.now() + RATE_LIMIT_PAUSE_MS;
+        pageWarn('[AutoHide] Reddit rate limited; pausing native hides for 60s');
+        break;
+      }
+      if (resp.status === 401 || resp.status === 403) {
+        capturedHeaders = null; // token rotated; re-capture and retry later
+        probeForAuth();
+        break;
+      }
+      entry.tries = (entry.tries || 0) + 1;
+      if (entry.tries >= MAX_REDDIT_TRIES) {
+        entry.reddit = 1; // stop retrying; local + server still hide it
+        pageWarn(`[AutoHide] Giving up on Reddit-side hide for ${id} after ${entry.tries} tries (still hidden locally and synced)`);
+      }
+    }
+    saveLedgerSoon();
+    updateCount();
   }
 
-  // --- Find scrollable ancestor (mobile Reddit uses a nested scroll container) ---
+  function startSyncLoop() {
+    if (syncInterval) return;
+    syncInterval = setInterval(async () => {
+      await pushRemote();
+      await pullRemote(false);
+      await drainRedditQueue();
+    }, SYNC_TICK_MS);
+  }
+
+  // ============================================================
+  // Scroll detection
+  // ============================================================
+
   function findScrollRoot() {
     const firstPost = document.querySelector('shreddit-post, article[data-testid="post-container"], #siteTable > .thing.link');
     if (!firstPost) return null;
@@ -292,26 +604,16 @@
       }
       el = el.parentElement;
     }
-    // Log all ancestors so we can diagnose
-    pageLog(`[AutoHide] No scroll container found. Ancestors: ${candidates.join(' → ')}`);
+    pageLog(`[AutoHide] No scroll container found. Ancestors: ${candidates.join(' -> ')}`);
     return null; // viewport is the scroll root
   }
 
-  // --- IntersectionObserver: detect scrolled-past posts ---
   function setupObserver() {
     if (observer) observer.disconnect();
 
     const scrollRoot = findScrollRoot();
     if (scrollRoot) {
-      pageLog(`[AutoHide] Using scroll container: <${scrollRoot.tagName.toLowerCase()}> class="${(scrollRoot.className || '').toString().slice(0, 60)}"`);
-    }
-
-    // Debug: log what posts are found and how they're structured
-    const debugPosts = getPostElements();
-    pageLog(`[AutoHide] Debug: ${debugPosts.length} posts found, tags: ${Array.from(new Set(Array.from(debugPosts).map(p => p.tagName))).join(',')}`);
-    if (debugPosts.length > 0) {
-      const p = debugPosts[0];
-      pageLog(`[AutoHide] Debug: first post tag=${p.tagName} id=${p.id || '(none)'} class=${(p.className||'').toString().slice(0,80)}`);
+      pageLog(`[AutoHide] Using scroll container: <${scrollRoot.tagName.toLowerCase()}>`);
     }
 
     observer = new IntersectionObserver((entries) => {
@@ -319,33 +621,27 @@
 
       for (const entry of entries) {
         const postId = getPostId(entry.target);
-        if (!postId) continue;
+        if (!postId || ledger.hidden[postId]) continue;
 
         if (entry.isIntersecting) {
-          if (!seenInViewport.has(postId)) {
-            pageLog(`[AutoHide] Seen: ${postId}`);
-          }
           seenInViewport.add(postId);
           if (seenTimers.has(postId)) {
             clearTimeout(seenTimers.get(postId));
             seenTimers.delete(postId);
           }
-        } else {
-          if (seenInViewport.has(postId) && !fadedPosts.has(postId) && !seenTimers.has(postId)) {
-            const rect = entry.boundingClientRect;
-            pageLog(`[AutoHide] Left viewport: ${postId} rect.bottom=${Math.round(rect.bottom)} rootTop=${scrollRoot ? Math.round(scrollRoot.getBoundingClientRect().top) : 'viewport'}`);
-            if (rect.bottom < 0 || (scrollRoot && rect.bottom < scrollRoot.getBoundingClientRect().top)) {
-              const el = entry.target;
-              seenTimers.set(postId, setTimeout(() => {
-                seenTimers.delete(postId);
-                fadePost(postId, el);
-              }, SCROLL_PAST_DELAY_MS));
-            }
+        } else if (seenInViewport.has(postId) && !seenTimers.has(postId)) {
+          const rect = entry.boundingClientRect;
+          if (rect.bottom < 0 || (scrollRoot && rect.bottom < scrollRoot.getBoundingClientRect().top)) {
+            const el = entry.target;
+            seenTimers.set(postId, setTimeout(() => {
+              seenTimers.delete(postId);
+              fadePost(postId, el);
+            }, SCROLL_PAST_DELAY_MS));
           }
         }
       }
     }, {
-      root: scrollRoot, // null = viewport (desktop), element = nested container (mobile)
+      root: scrollRoot,
       threshold: [0, 0.1],
       rootMargin: '0px',
     });
@@ -355,59 +651,54 @@
 
   function observeAllPosts() {
     if (!observer) return;
-    const posts = getPostElements();
-    posts.forEach(post => {
+    applyLedgerToPosts();
+    for (const post of getPostElements()) {
+      const postId = getPostId(post);
+      if (postId && ledger.hidden[postId]) continue;
       if (!post.dataset.autoHideObserved) {
         observer.observe(post);
         post.dataset.autoHideObserved = 'true';
       }
-    });
+    }
   }
 
-  // --- Scroll-based fallback for mobile browsers where IntersectionObserver
-  //     may not fire exit events reliably (e.g. Firefox Android) ---
-  let scrollFallbackTimer = null;
+  // Some mobile browsers (Firefox Android) do not fire reliable exit events.
   function setupScrollFallback() {
-    const scrollTarget = window;
     let lastCheck = 0;
 
     function checkScrolledPast() {
       if (!enabled || showHidden) return;
       const now = Date.now();
-      if (now - lastCheck < 300) return; // throttle to ~3Hz
+      if (now - lastCheck < 300) return;
       lastCheck = now;
 
-      const posts = getPostElements();
-      posts.forEach(post => {
+      for (const post of getPostElements()) {
         const postId = getPostId(post);
-        if (!postId || fadedPosts.has(postId)) return;
+        if (!postId || ledger.hidden[postId]) continue;
 
         const rect = post.getBoundingClientRect();
-        // Post is fully above the viewport
         if (rect.bottom < 0) {
           if (!seenTimers.has(postId)) {
-            seenInViewport.add(postId); // ensure it's marked seen
+            seenInViewport.add(postId);
             seenTimers.set(postId, setTimeout(() => {
               seenTimers.delete(postId);
               fadePost(postId, post);
             }, SCROLL_PAST_DELAY_MS));
           }
         } else if (rect.top < window.innerHeight && rect.bottom > 0) {
-          // Post is in viewport — mark as seen, cancel any pending fade
           seenInViewport.add(postId);
           if (seenTimers.has(postId)) {
             clearTimeout(seenTimers.get(postId));
             seenTimers.delete(postId);
           }
         }
-      });
+      }
     }
 
-    scrollTarget.addEventListener('scroll', checkScrolledPast, { passive: true });
+    window.addEventListener('scroll', checkScrolledPast, { passive: true });
     pageLog('[AutoHide] Scroll fallback listener installed');
   }
 
-  // --- Watch for dynamically loaded posts (infinite scroll) ---
   function setupMutationObserver() {
     if (mutationObserver) mutationObserver.disconnect();
 
@@ -419,14 +710,13 @@
       ? document.querySelector('#siteTable')
       : document.querySelector('shreddit-feed, [data-testid="posts-list"], main');
 
-    if (feedContainer) {
-      mutationObserver.observe(feedContainer, { childList: true, subtree: true });
-    } else {
-      mutationObserver.observe(document.body, { childList: true, subtree: true });
-    }
+    mutationObserver.observe(feedContainer || document.body, { childList: true, subtree: true });
   }
 
-  // --- Toggle UI ---
+  // ============================================================
+  // UI
+  // ============================================================
+
   function createToggleUI() {
     const container = document.createElement('div');
     container.id = 'auto-hide-toggle';
@@ -446,51 +736,37 @@
     const showBtn = document.createElement('button');
     showBtn.id = 'auto-hide-show-btn';
     showBtn.textContent = 'Show Hidden';
-    showBtn.title = 'Temporarily reveal posts hidden this session';
+    showBtn.title = 'Temporarily reveal hidden posts on this page';
     showBtn.addEventListener('click', () => {
       showHidden = !showHidden;
       showBtn.textContent = showHidden ? 'Resume Hiding' : 'Show Hidden';
       showBtn.classList.toggle('active', showHidden);
-
-      if (showHidden) {
-        for (const [, el] of fadedPosts) {
-          el.style.opacity = '1';
-        }
-      } else {
-        for (const [, el] of fadedPosts) {
-          el.style.opacity = '0.15';
-        }
-      }
+      refreshVisuals();
     });
 
-    const unhideAllBtn = document.createElement('button');
-    unhideAllBtn.id = 'auto-hide-unhide-btn';
-    unhideAllBtn.textContent = 'Unhide All';
-    unhideAllBtn.title = 'Unhide all posts hidden this session (restores them permanently)';
-    unhideAllBtn.addEventListener('click', async () => {
-      if (fadedPosts.size === 0) return;
-      unhideAllBtn.textContent = 'Unhiding...';
+    const unhideBtn = document.createElement('button');
+    unhideBtn.id = 'auto-hide-unhide-btn';
+    unhideBtn.textContent = 'Unhide Page';
+    unhideBtn.title = 'Unhide the hidden posts on this page everywhere: locally, on the sync server, and on Reddit';
+    unhideBtn.addEventListener('click', async () => {
+      const ids = Array.from(onPage.keys()).filter((id) => ledger.hidden[id]);
+      if (ids.length === 0) return;
+      unhideBtn.textContent = 'Unhiding...';
 
-      // Restore opacity immediately
-      for (const [, el] of fadedPosts) {
-        el.style.opacity = '1';
-      }
-
-      // Unhide via API for any that were API-hidden
-      const toUnhide = Array.from(apiHidden);
-      for (const id of toUnhide) {
-        await unhidePost(id);
-      }
-
-      fadedPosts.clear();
-      pendingHides.clear();
-      apiHidden.clear();
+      const redditSynced = ids.filter((id) => ledger.hidden[id].reddit);
+      for (const id of ids) recordUnhidden(id);
+      saveLedgerNow();
+      refreshVisuals();
       updateCount();
 
-      unhideAllBtn.textContent = 'Unhide All';
+      for (const id of redditSynced) await redditUnhide(id);
+      await pushRemote();
+
+      unhideBtn.textContent = 'Unhide Page';
       showHidden = false;
       showBtn.textContent = 'Show Hidden';
       showBtn.classList.remove('active');
+      pageLog(`[AutoHide] Unhid ${ids.length} post(s)`);
     });
 
     countDisplay = document.createElement('span');
@@ -499,13 +775,16 @@
 
     container.appendChild(enableBtn);
     container.appendChild(showBtn);
-    container.appendChild(unhideAllBtn);
+    container.appendChild(unhideBtn);
     container.appendChild(countDisplay);
     document.body.appendChild(container);
+    updateCount();
   }
 
-  // --- Styles ---
   GM_addStyle(`
+    .ah-collapsed { display: none !important; }
+    .ah-faded { opacity: 0.15 !important; transition: opacity 0.3s; }
+
     #auto-hide-toggle {
       position: fixed;
       bottom: 16px;
@@ -524,9 +803,7 @@
       transition: opacity 0.2s;
     }
 
-    #auto-hide-toggle:hover {
-      opacity: 1 !important;
-    }
+    #auto-hide-toggle:hover { opacity: 1 !important; }
 
     #auto-hide-toggle button {
       background: #272729;
@@ -540,9 +817,7 @@
       transition: background 0.15s;
     }
 
-    #auto-hide-toggle button:hover {
-      background: #3a3a3c;
-    }
+    #auto-hide-toggle button:hover { background: #3a3a3c; }
 
     #auto-hide-enable-btn {
       background: #0079d3 !important;
@@ -579,12 +854,8 @@
         color: #1c1c1c;
         border-color: #edeff1;
       }
-      #auto-hide-toggle button:hover {
-        background: #e8e8e8;
-      }
-      #auto-hide-count {
-        color: #7c7c7c;
-      }
+      #auto-hide-toggle button:hover { background: #e8e8e8; }
+      #auto-hide-count { color: #7c7c7c; }
     }
 
     #auto-hide-toggle:not(:hover) #auto-hide-show-btn,
@@ -593,9 +864,94 @@
     }
   `);
 
-  // --- Skip non-feed pages ---
+  // ============================================================
+  // Menu commands
+  // ============================================================
+
+  function registerMenu() {
+    GM_registerMenuCommand('Auto-Hide: configure sync', async () => {
+      const base = unsafeWindow.prompt(
+        'Sync server base URL, e.g. https://example.com/reddit-hide\nLeave blank to turn cross-device sync off (hides still persist on this device).',
+        syncBase()
+      );
+      if (base === null) return;
+      const cleanBase = base.trim().replace(/\/$/, '');
+      GM_setValue(SYNC_BASE_NAME, cleanBase);
+      if (!cleanBase) {
+        GM_setValue(SYNC_KEY_NAME, '');
+        pageLog('[AutoHide] Cross-device sync disabled');
+        updateCount();
+        return;
+      }
+
+      const key = unsafeWindow.prompt('API key for ' + cleanBase + ' (sent as a Bearer token)', syncKey());
+      if (key === null) return;
+      GM_setValue(SYNC_KEY_NAME, key.trim());
+      syncKeyWarned = false;
+      updateCount();
+
+      // Prove the credentials work now rather than failing silently later.
+      const health = await gmFetch(`${cleanBase}/api/health`, 'GET', {});
+      if (!health.ok) {
+        unsafeWindow.alert(`Saved, but ${cleanBase}/api/health returned ${health.status || 'no response'}.\nCheck the URL and that the server is reachable.`);
+        return;
+      }
+      const probe = await gmFetch(`${cleanBase}/api/hidden?since=0&limit=1`, 'GET', syncHeaders());
+      if (!probe.ok) {
+        unsafeWindow.alert(`Server is up but rejected the key (HTTP ${probe.status}).\nRe-run "configure sync" with the correct key.`);
+        return;
+      }
+      await pullRemote(true);
+      await pushRemote();
+      unsafeWindow.alert(`Sync connected to ${cleanBase}.\n${hiddenCount()} hidden posts known on this device.`);
+    });
+
+    GM_registerMenuCommand('Auto-Hide: sync now', async () => {
+      await pushRemote();
+      await pullRemote(true);
+      await drainRedditQueue();
+      unsafeWindow.alert(`Auto-Hide sync done.\n${hiddenCount()} hidden, ${idsNeeding('remote').length} still queued for the sync server.`);
+    });
+
+    GM_registerMenuCommand('Auto-Hide: status', () => {
+      const msg = [
+        `Hidden posts: ${hiddenCount()}`,
+        `Queued for sync server: ${idsNeeding('remote').length} adds, ${pendingTombIds().length} removes`,
+        `Queued for Reddit hide: ${idsNeeding('reddit').length}`,
+        `Sync key: ${syncKey() ? 'set' : 'NOT SET (device-local only)'}`,
+        `Reddit auth: ${capturedHeaders ? 'captured' : 'not captured yet'}`,
+        `Last pull cursor: ${ledger.lastPull ? new Date(ledger.lastPull).toLocaleString() : 'never'}`,
+      ].join('\n');
+      pageLog('[AutoHide] ' + msg.replace(/\n/g, ' | '));
+      unsafeWindow.alert(msg);
+    });
+
+    GM_registerMenuCommand('Auto-Hide: forget all hidden posts', async () => {
+      const total = hiddenCount();
+      if (!total) return;
+      if (!unsafeWindow.confirm(`Unhide all ${total} posts on every device? This also clears them from the sync server.`)) return;
+      for (const id of Object.keys(ledger.hidden)) recordUnhidden(id);
+      saveLedgerNow();
+      refreshVisuals();
+      if (syncEnabled()) {
+        const resp = await gmFetch(`${syncBase()}/api/hidden`, 'DELETE', syncHeaders(), JSON.stringify({ all: true }));
+        if (resp.ok) {
+          ledger.tombs = {};
+          saveLedgerNow();
+        }
+      }
+      updateCount();
+      pageLog(`[AutoHide] Cleared ${total} hidden posts`);
+    });
+  }
+
+  // ============================================================
+  // Init
+  // ============================================================
+
   function isFeedPage() {
     const path = location.pathname;
+    if (path.includes('/comments/') && !path.match(/\/user\/[^/]+\/comments\/?$/)) return false;
     return path === '/' ||
       path.startsWith('/r/') ||
       path.startsWith('/user/') ||
@@ -608,34 +964,46 @@
       path.startsWith('/rising');
   }
 
-  // --- Init ---
   function init() {
-    if (location.pathname.includes('/comments/') && !location.pathname.endsWith('/comments/')) {
-      if (!location.pathname.match(/\/user\/[^/]+\/comments\/?$/)) return;
-    }
-    if (!isFeedPage()) return;
+    ledger = loadLedger();
+    registerMenu();
 
-    const posts = getPostElements();
-    pageLog(`[AutoHide] v2.4 init on ${location.href} — ${posts.length} posts, enabled=${enabled}`);
+    // The sync loop runs on every Reddit page, not just feeds: a queue left over
+    // from a fast scroll gets flushed even if the next page is a comment thread.
+    startSyncLoop();
+    setTimeout(probeForAuth, 1000);
+    setTimeout(probeForAuth, 5000);
+    pullRemote(true);
+
+    const flush = () => saveLedgerNow();
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('beforeunload', flush);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') saveLedgerNow();
+      else pullRemote(false);
+    });
+
+    feedMode = isFeedPage();
+    pageLog(`[AutoHide] v3.0 init on ${location.href} — feed=${feedMode}, ledger=${hiddenCount()}, ` +
+      `queued(remote)=${idsNeeding('remote').length}, queued(reddit)=${idsNeeding('reddit').length}, enabled=${enabled}`);
+    if (!feedMode) return;
+
     createToggleUI();
+    applyLedgerToPosts();
     setupObserver();
     setupScrollFallback();
     setupMutationObserver();
-    startBatchProcessor();
-    // Try to capture auth immediately — on mobile, Reddit may not make
-    // authenticated requests until user interaction
-    setTimeout(probeForAuth, 1000);
-    setTimeout(probeForAuth, 5000);
 
     let lastUrl = location.href;
     const navObserver = new MutationObserver(() => {
-      if (location.href !== lastUrl) {
-        lastUrl = location.href;
-        if (isFeedPage()) {
-          setupObserver();
-          setupMutationObserver();
-        }
-      }
+      if (location.href === lastUrl) return;
+      lastUrl = location.href;
+      feedMode = isFeedPage();
+      if (!feedMode) return;
+      onPage.clear();
+      applyLedgerToPosts();
+      setupObserver();
+      setupMutationObserver();
     });
     navObserver.observe(document.body, { childList: true, subtree: true });
   }
