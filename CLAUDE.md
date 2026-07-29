@@ -87,3 +87,35 @@ Server: see README (`ProxyPass` a path prefix, set `BASE_PATH`, `pm2 start ecosy
 
 Userscript: bump `@version`, then sync via the TM script deploy in the browser-agent repo (source
 map + install-page version both need updating).
+
+## The bug class this repo exists to prevent
+
+**A feature that delegates durability to a fire-and-forget remote write works
+perfectly inside one page life and silently forgets everything on the next load.**
+Reported by users as "works in a given tab session but isn't reliably on next
+fetch" -- that phrasing is diagnostic: in-session correctness plus cross-session
+loss means the in-memory path is fine and the durability path is missing. Do not
+start by debugging the hide logic.
+
+The v2.4 shape, for reference:
+
+    batch.forEach(id => pending.delete(id));    // dequeued FIRST
+    for (const id of batch) await hidePost(id); // then attempted
+
+Auth-not-yet-captured, 401, 429, timeout, or navigation each dropped the item
+permanently while the UI still counted it. A startup race guaranteed the first
+few: the drain timer fired at t=2s, the auth probe at t=1s/5s.
+
+The invariants above are the fix. Two extra notes that live here rather than in
+the invariants:
+
+- **Delta cursors must only advance past rows actually returned.** On a truncated
+  page, `nextSince` is the timestamp of the last row sent, not "now".
+- **Every API response sends `Cache-Control: no-store`.** The production host sits
+  behind a CDN with an edge cache; a cached delta response hands the client a
+  stale cursor and silently drops everything in between. Verify with
+  `curl -sD -`: the cache-status header must never say `HIT`.
+
+Full cross-cutting write-up, including the rules for any component whose
+durability depends on an outbound call: knowledgeBase
+`patterns/remote-api-is-not-persistence.md`.
