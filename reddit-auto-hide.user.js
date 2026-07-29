@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Auto-Hide Seen Posts
 // @namespace    https://github.com/npezarro/scripts
-// @version      3.1
+// @version      3.2
 // @description  Automatically hides Reddit posts after you scroll past them. Keeps a durable local ledger plus an optional authenticated sync server, so hides survive reloads and follow you across devices.
 // @author       npezarro
 // @match        *://*.reddit.com/*
@@ -32,6 +32,7 @@
   const REMOTE_BATCH = 500;           // ids per sync request (server caps at 500)
   const MAX_REDDIT_TRIES = 8;         // give up on the native hide, keep hiding locally
   const RATE_LIMIT_PAUSE_MS = 60000;
+  const AUTH_PROBE_INTERVAL_MS = 30000;  // network probe floor when logged out
 
   // Sync server is configured per device (Tampermonkey menu -> "Auto-Hide: configure
   // sync"), never hardcoded here: this file is published for auto-update.
@@ -333,8 +334,11 @@
     pageWarn('[AutoHide] Failed to install auth interceptors: ' + e.message);
   }
 
+  let lastAuthProbeAt = 0;
+
   function probeForAuth() {
     if (capturedHeaders) return;
+    // The cheap in-page lookups are free, so always try those first.
     try {
       const cfg = unsafeWindow.__r;
       if (cfg && cfg.config && cfg.config.accessToken) {
@@ -354,6 +358,13 @@
         }
       }
     } catch (e) { /* no inline token */ }
+
+    // The network probe is throttled: the sync loop calls this on every tick
+    // while the Reddit queue is non-empty, and a logged-out session would
+    // otherwise fire a request every couple of seconds forever.
+    const now = Date.now();
+    if (now - lastAuthProbeAt < AUTH_PROBE_INTERVAL_MS) return;
+    lastAuthProbeAt = now;
     try {
       unsafeWindow.fetch('https://www.reddit.com/svc/shreddit/graphql', {
         method: 'POST',
@@ -1044,7 +1055,7 @@
     });
 
     feedMode = isFeedPage();
-    pageLog(`[AutoHide] v3.1 init on ${location.href} — feed=${feedMode}, ledger=${hiddenCount()}, ` +
+    pageLog(`[AutoHide] v3.2 init on ${location.href} — feed=${feedMode}, ledger=${hiddenCount()}, ` +
       `queued(remote)=${idsNeeding('remote').length}, queued(reddit)=${idsNeeding('reddit').length}, enabled=${enabled}`);
     if (!feedMode) return;
 
