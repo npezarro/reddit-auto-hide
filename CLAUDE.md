@@ -17,6 +17,30 @@ literals. A pre-commit hook enforces this; do not `--no-verify` around it.
 | `test/store.test.js` | `node:test` unit tests for the store. |
 | `test/integration.mjs` | Real userscript in Chromium against a real server. Needs `SYNC_BASE` + `SYNC_KEY`. |
 | `ecosystem.config.cjs` | PM2 config. No `cwd` field: start it from the repo directory. |
+| `sync-hub-module.sh` | Copies this userscript into the browser extension's `modules/`. `--check` fails on drift. |
+
+## One file, two platforms
+
+`reddit-auto-hide.user.js` runs both as a Tampermonkey userscript and as a
+MAIN-world module in the browser extension. All platform differences live in the
+single `PLATFORM` adapter block near the top; **never** add a second copy of the
+logic. A hand-maintained second copy is exactly why the extension sat on v2.4 for
+months after the userscript reached v3.x, so desktop kept the original bug.
+
+After any change: `./sync-hub-module.sh` to copy it into the extension, and bump the
+module `version` in that repo's two `DEFAULT_MODULES` arrays (`background.js` and
+`content-loader.js`).
+
+In the extension, MAIN world has no `chrome.*` APIs and Reddit serves
+`default-src 'none'` with no `connect-src`, so page-context fetches are blocked
+outright. Storage and network therefore go through the extension's postMessage
+bridge, and the sync credential stays in the service worker: page scripts can read
+bridge traffic, so the module asks for calls it cannot itself authorize. Config for
+that path lives in the extension popup, not in the page.
+
+Both delivery paths match Reddit pages, so a `W.__redditAutoHideOwner` sentinel makes
+the second one to load stand down rather than installing a duplicate toolbar and a
+second set of observers.
 
 ## Commands
 
