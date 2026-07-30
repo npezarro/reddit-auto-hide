@@ -43,7 +43,7 @@
   const LEDGER_MAX_AGE_MS = 180 * 24 * 60 * 60 * 1000;
 
   // --- State ---
-  let enabled = GM_getValue('autoHideEnabled', true);
+  let enabled = true;                 // real value loaded in init()
   let showHidden = false;
   let feedMode = false;               // observers/UI only run on feed pages
   const seenTimers = new Map();       // postId -> timeout handle
@@ -63,18 +63,181 @@
   // waiting to be pushed so they do not come back from another device.
   let ledger = { hidden: {}, tombs: {}, lastPull: 0 };
 
+  // The page's own window. Tampermonkey sandboxes the script and exposes the real
+  // one as unsafeWindow; an extension MAIN-world script is already in page context.
+  const W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
   // --- Logging via page console (visible to browser-logs) ---
-  const pageLog = unsafeWindow.console.log.bind(unsafeWindow.console);
-  const pageWarn = unsafeWindow.console.warn.bind(unsafeWindow.console);
+  const pageLog = W.console.log.bind(W.console);
+  const pageWarn = W.console.warn.bind(W.console);
+
+  // ============================================================
+  // Platform adapter
+  // ============================================================
+  //
+  // This one file runs in two places: as a Tampermonkey userscript (mobile Firefox,
+  // and anywhere TM is installed) and as a chrome-automation MAIN-world module on
+  // desktop. Every platform difference is confined to this block so there is
+  // exactly one copy of the hiding and sync logic. Two copies is precisely how the
+  // hub ended up still running v2.4 months after the userscript moved on.
+  //
+  // In the extension, MAIN world has no chrome.* APIs, and Reddit serves
+  // `default-src 'none'` with no connect-src, which blocks every fetch attempted
+  // from page context. So both storage and network go through the hub's postMessage
+  // bridge. The sync credential deliberately stays in the service worker: page
+  // scripts can read bridge traffic, so this module asks for calls it is not itself
+  // able to authorize.
+
+  const IS_TM = typeof GM_getValue === 'function' && typeof GM_xmlhttpRequest === 'function';
+
+  function tmPlatform() {
+    const cfg = { base: '', key: '' };
+
+    function rawFetch(url, method, headers, body) {
+      return new Promise((resolve) => {
+        GM_xmlhttpRequest({
+          method,
+          url,
+          headers,
+          data: body,
+          timeout: 15000,
+          onload: (r) => resolve({ ok: r.status >= 200 && r.status < 300, status: r.status, text: r.responseText }),
+          onerror: (e) => resolve({ ok: false, status: 0, text: `Network error: ${(e && e.error) || 'unknown'}` }),
+          ontimeout: () => resolve({ ok: false, status: 0, text: 'Timeout' }),
+        });
+      });
+    }
+
+    const jsonHeaders = () => ({
+      'Authorization': `Bearer ${cfg.key}`,
+      'Content-Type': 'application/json',
+    });
+
+    return {
+      name: 'tampermonkey',
+      canConfigureInPage: true,
+      async init() {
+        cfg.base = String(GM_getValue(SYNC_BASE_NAME, '') || '').replace(/\/$/, '');
+        cfg.key = String(GM_getValue(SYNC_KEY_NAME, '') || '');
+      },
+      storeGet: (k, d) => Promise.resolve(GM_getValue(k, d)),
+      storeSet: (k, v) => { GM_setValue(k, v); return Promise.resolve(); },
+      syncConfigured: () => Boolean(cfg.base && cfg.key),
+      getSyncBase: () => cfg.base,
+      getSyncKey: () => cfg.key,
+      setSyncConfig(base, key) {
+        cfg.base = String(base || '').replace(/\/$/, '');
+        cfg.key = String(key || '');
+        GM_setValue(SYNC_BASE_NAME, cfg.base);
+        GM_setValue(SYNC_KEY_NAME, cfg.key);
+      },
+      configHint: 'Tampermonkey menu -> "Auto-Hide: configure sync"',
+      syncFetch: (path, method, body) => rawFetch(cfg.base + path, method, jsonHeaders(), body),
+      redditFetch: (path, body, authorization) => rawFetch('https://oauth.reddit.com' + path, 'POST', {
+        'Authorization': authorization,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      }, body),
+      rawFetch,
+      addStyle: (css) => GM_addStyle(css),
+      menu: (name, fn) => GM_registerMenuCommand(name, fn),
+      clipboard: (text) => GM_setClipboard(text),
+    };
+  }
+
+  function hubPlatform() {
+    const REQ = 'autohub-bridge-request';
+    const RES = 'autohub-bridge-response';
+    const pending = new Map();
+    let seq = 0;
+    let configured = false;
+
+    window.addEventListener('message', (event) => {
+      if (event.source !== window) return;
+      const m = event.data;
+      if (!m || m.__autohub !== RES || typeof m.id !== 'string') return;
+      const resolve = pending.get(m.id);
+      if (!resolve) return;
+      pending.delete(m.id);
+      resolve(m.result || { ok: false, error: 'no result' });
+    });
+
+    function call(op, args) {
+      return new Promise((resolve) => {
+        const id = `ah${++seq}-${Math.random().toString(36).slice(2)}`;
+        pending.set(id, resolve);
+        setTimeout(() => {
+          if (pending.delete(id)) resolve({ ok: false, error: 'bridge timeout' });
+        }, 20000);
+        window.postMessage({ __autohub: REQ, id, op, args }, location.origin);
+      });
+    }
+
+    const asResponse = (r) => ({
+      ok: Boolean(r && r.ok),
+      status: (r && r.status) || 0,
+      text: (r && (r.body != null ? r.body : r.error)) || '',
+    });
+
+    return {
+      name: 'automation-hub',
+      canConfigureInPage: false,
+      async init() {
+        // The key lives in the service worker, so the only way to know whether sync
+        // is usable is to ask it.
+        const r = await call('fetch', { service: 'reddit-hide', path: '/api/health', method: 'GET' });
+        configured = Boolean(r && r.ok);
+        if (!configured) {
+          pageWarn(`[AutoHide] Cross-device sync unavailable (${(r && r.error) || 'no response'}). Set it in the Automation Hub popup.`);
+        }
+      },
+      storeGet: async (k, d) => {
+        const r = await call('storageGet', { key: k });
+        return r && r.ok && r.value != null ? r.value : d;
+      },
+      storeSet: async (k, v) => { await call('storageSet', { key: k, value: v }); },
+      syncConfigured: () => configured,
+      getSyncBase: () => '(managed by the extension)',
+      getSyncKey: () => '',
+      setSyncConfig() { /* configured in the hub popup, never from page context */ },
+      configHint: 'Automation Hub popup -> "Reddit Auto-Hide Sync"',
+      syncFetch: async (path, method, body) =>
+        asResponse(await call('fetch', { service: 'reddit-hide', path, method, body })),
+      redditFetch: async (path, body, authorization) =>
+        asResponse(await call('fetch', {
+          service: 'reddit-api', path, method: 'POST', body,
+          authorization, contentType: 'application/x-www-form-urlencoded',
+        })),
+      rawFetch: async () => ({ ok: false, status: 0, text: 'raw fetch not available in the extension' }),
+      addStyle: (css) => {
+        const el = document.createElement('style');
+        el.textContent = css;
+        (document.head || document.documentElement).appendChild(el);
+      },
+      menu: () => { /* no menu surface; config is in the hub popup */ },
+      clipboard: (text) => { try { navigator.clipboard.writeText(text); } catch (e) { /* best effort */ } },
+    };
+  }
+
+  const PLATFORM = IS_TM ? tmPlatform() : hubPlatform();
+
+  // Both delivery paths can match the same Reddit page: the userscript on any
+  // browser, and the Automation Hub module on desktop Chrome. Without this guard the
+  // page gets two IntersectionObservers, two toolbars, and two writers racing the
+  // same ledger. First to load wins; the other stands down and says so.
+  if (W.__redditAutoHideOwner) {
+    W.console.log(`[AutoHide] Already running via ${W.__redditAutoHideOwner}; ${PLATFORM.name} standing down`);
+    return;
+  }
+  W.__redditAutoHideOwner = PLATFORM.name;
 
   // ============================================================
   // Durable ledger
   // ============================================================
 
-  function loadLedger() {
+  async function loadLedger() {
     let raw = null;
     try {
-      raw = JSON.parse(GM_getValue(LEDGER_KEY, 'null'));
+      raw = JSON.parse(await PLATFORM.storeGet(LEDGER_KEY, 'null'));
     } catch (e) {
       pageWarn('[AutoHide] Ledger unreadable, starting fresh: ' + e.message);
     }
@@ -111,7 +274,7 @@
       saveTimer = null;
     }
     try {
-      GM_setValue(LEDGER_KEY, JSON.stringify(ledger));
+      PLATFORM.storeSet(LEDGER_KEY, JSON.stringify(ledger));
     } catch (e) {
       pageWarn('[AutoHide] Ledger save failed: ' + e.message);
     }
@@ -256,7 +419,7 @@
     const total = hiddenCount();
     const queued = idsNeeding('remote').length + pendingTombIds().length;
     countDisplay.textContent = queued > 0 ? `${total} hidden (${queued} syncing)` : `${total} hidden`;
-    const key = GM_getValue(SYNC_KEY_NAME, '');
+    const key = PLATFORM.syncConfigured();
     countDisplay.title = key
       ? `${total} hidden locally, ${queued} awaiting server sync, ${idsNeeding('reddit').length} awaiting Reddit hide`
       : 'Cross-device sync is OFF. Use the Tampermonkey menu: "Auto-Hide: configure sync".';
@@ -286,7 +449,7 @@
     if (!h) return null;
     const captured = {};
     try {
-      if (h instanceof unsafeWindow.Headers || (h.forEach && h.get)) {
+      if ((W.Headers && h instanceof W.Headers) || (h.forEach && h.get)) {
         h.forEach(function (v, k) { captured[k.toLowerCase()] = v; });
       } else if (typeof h === 'object' && !Array.isArray(h)) {
         for (const k in h) { if (Object.prototype.hasOwnProperty.call(h, k)) captured[k.toLowerCase()] = h[k]; }
@@ -296,7 +459,7 @@
   }
 
   try {
-    const win = unsafeWindow;
+    const win = W;
 
     const origFetch = win.fetch.bind(win);
     win.fetch = function (input, init) {
@@ -329,7 +492,7 @@
       return origSend.apply(this, arguments);
     };
 
-    pageLog('[AutoHide] Auth interceptors installed via unsafeWindow');
+    pageLog(`[AutoHide] Auth interceptors installed (${PLATFORM.name})`);
   } catch (e) {
     pageWarn('[AutoHide] Failed to install auth interceptors: ' + e.message);
   }
@@ -340,7 +503,7 @@
     if (capturedHeaders) return;
     // The cheap in-page lookups are free, so always try those first.
     try {
-      const cfg = unsafeWindow.__r;
+      const cfg = W.__r;
       if (cfg && cfg.config && cfg.config.accessToken) {
         captureAuth({ 'authorization': `Bearer ${cfg.config.accessToken}` });
         return;
@@ -366,7 +529,7 @@
     if (now - lastAuthProbeAt < AUTH_PROBE_INTERVAL_MS) return;
     lastAuthProbeAt = now;
     try {
-      unsafeWindow.fetch('https://www.reddit.com/svc/shreddit/graphql', {
+      W.fetch('https://www.reddit.com/svc/shreddit/graphql', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: 'me' }),
@@ -376,42 +539,11 @@
   }
 
   // ============================================================
-  // HTTP
-  // ============================================================
-
-  function gmFetch(url, method, headers, body) {
-    return new Promise((resolve) => {
-      GM_xmlhttpRequest({
-        method,
-        url,
-        headers,
-        data: body,
-        timeout: 15000,
-        onload: (r) => resolve({ ok: r.status >= 200 && r.status < 300, status: r.status, text: r.responseText }),
-        onerror: (e) => resolve({ ok: false, status: 0, text: `Network error: ${(e && e.error) || 'unknown'}` }),
-        ontimeout: () => resolve({ ok: false, status: 0, text: 'Timeout' }),
-      });
-    });
-  }
-
-  // ============================================================
   // Sync server (cross-device source of truth)
   // ============================================================
 
-  function syncKey() {
-    return GM_getValue(SYNC_KEY_NAME, '');
-  }
-
-  function syncBase() {
-    return GM_getValue(SYNC_BASE_NAME, '').replace(/\/$/, '');
-  }
-
-  function syncHeaders() {
-    return {
-      'Authorization': `Bearer ${syncKey()}`,
-      'Content-Type': 'application/json',
-    };
-  }
+  const syncKey = () => PLATFORM.getSyncKey();
+  const syncBase = () => PLATFORM.getSyncBase();
 
   let syncKeyWarned = false;
 
@@ -427,7 +559,7 @@
 
     let decoded = '';
     try {
-      decoded = unsafeWindow.atob(decodeURIComponent(match[1]));
+      decoded = W.atob(decodeURIComponent(match[1]));
     } catch (e) {
       pageWarn('[AutoHide] Sync link is not valid base64, ignoring');
       return false;
@@ -444,14 +576,13 @@
       return false;
     }
 
-    GM_setValue(SYNC_BASE_NAME, base);
-    GM_setValue(SYNC_KEY_NAME, key);
+    PLATFORM.setSyncConfig(base, key);
     syncKeyWarned = false;
 
     // Do not leave the key sitting in the URL bar or this history entry.
     try {
       const clean = location.href.replace(/[#&]autohide-sync=[^&]*/, '');
-      unsafeWindow.history.replaceState(null, '', clean || location.pathname);
+      W.history.replaceState(null, '', clean || location.pathname);
     } catch (e) { /* cosmetic only */ }
 
     pageLog('[AutoHide] Sync configured from link: ' + base);
@@ -459,10 +590,10 @@
   }
 
   function syncEnabled() {
-    if (syncKey() && syncBase()) return true;
+    if (PLATFORM.syncConfigured()) return true;
     if (!syncKeyWarned) {
       syncKeyWarned = true;
-      pageWarn('[AutoHide] Cross-device sync is off (no endpoint/key). Hides still persist on this device. Tampermonkey menu -> "Auto-Hide: configure sync".');
+      pageWarn(`[AutoHide] Cross-device sync is off. Hides still persist on this device. Configure via ${PLATFORM.configHint}.`);
     }
     return false;
   }
@@ -481,8 +612,7 @@
       let removed = 0;
       while (more && guard < 20) {
         guard++;
-        const url = `${syncBase()}/api/hidden?since=${ledger.lastPull}&limit=5000`;
-        const resp = await gmFetch(url, 'GET', syncHeaders());
+        const resp = await PLATFORM.syncFetch(`/api/hidden?since=${ledger.lastPull}&limit=5000`, 'GET');
         if (!resp.ok) {
           pageWarn(`[AutoHide] Pull failed (${resp.status}): ${String(resp.text).slice(0, 160)}`);
           return;
@@ -543,7 +673,7 @@
     try {
       const toAdd = idsNeeding('remote').slice(0, REMOTE_BATCH);
       if (toAdd.length) {
-        const resp = await gmFetch(`${syncBase()}/api/hidden`, 'POST', syncHeaders(), JSON.stringify({ ids: toAdd }));
+        const resp = await PLATFORM.syncFetch('/api/hidden', 'POST', JSON.stringify({ ids: toAdd }));
         if (resp.ok) {
           for (const id of toAdd) {
             if (ledger.hidden[id]) ledger.hidden[id].remote = 1;
@@ -557,7 +687,7 @@
 
       const toDelete = pendingTombIds().slice(0, REMOTE_BATCH);
       if (toDelete.length) {
-        const resp = await gmFetch(`${syncBase()}/api/hidden`, 'DELETE', syncHeaders(), JSON.stringify({ ids: toDelete }));
+        const resp = await PLATFORM.syncFetch('/api/hidden', 'DELETE', JSON.stringify({ ids: toDelete }));
         if (resp.ok) {
           for (const id of toDelete) delete ledger.tombs[id];
           saveLedgerNow();
@@ -579,19 +709,13 @@
   async function redditHide(id) {
     const auth = capturedHeaders;
     if (!auth || !auth['authorization']) return { ok: false, status: -1 };
-    return gmFetch('https://oauth.reddit.com/api/hide', 'POST', {
-      'Authorization': auth['authorization'],
-      'Content-Type': 'application/x-www-form-urlencoded',
-    }, `id=${id}`);
+    return PLATFORM.redditFetch('/api/hide', `id=${id}`, auth['authorization']);
   }
 
   async function redditUnhide(id) {
     const auth = capturedHeaders;
     if (!auth || !auth['authorization']) return { ok: false, status: -1 };
-    return gmFetch('https://oauth.reddit.com/api/unhide', 'POST', {
-      'Authorization': auth['authorization'],
-      'Content-Type': 'application/x-www-form-urlencoded',
-    }, `id=${id}`);
+    return PLATFORM.redditFetch('/api/unhide', `id=${id}`, auth['authorization']);
   }
 
   async function drainRedditQueue() {
@@ -782,7 +906,7 @@
     enableBtn.title = 'Toggle auto-hiding of seen posts';
     enableBtn.addEventListener('click', () => {
       enabled = !enabled;
-      GM_setValue('autoHideEnabled', enabled);
+      PLATFORM.storeSet('autoHideEnabled', enabled);
       enableBtn.textContent = enabled ? 'Auto-Hide: ON' : 'Auto-Hide: OFF';
       enableBtn.classList.toggle('disabled', !enabled);
     });
@@ -836,7 +960,7 @@
     updateCount();
   }
 
-  GM_addStyle(`
+  PLATFORM.addStyle(`
     .ah-collapsed { display: none !important; }
     .ah-faded { opacity: 0.15 !important; transition: opacity 0.3s; }
 
@@ -924,66 +1048,68 @@
   // ============================================================
 
   function registerMenu() {
-    GM_registerMenuCommand('Auto-Hide: configure sync', async () => {
-      const base = unsafeWindow.prompt(
+    if (!PLATFORM.canConfigureInPage) return; // hub config lives in the extension popup
+
+    PLATFORM.menu('Auto-Hide: configure sync', async () => {
+      const base = W.prompt(
         'Sync server base URL, e.g. https://example.com/reddit-hide\nLeave blank to turn cross-device sync off (hides still persist on this device).',
         syncBase()
       );
       if (base === null) return;
       const cleanBase = base.trim().replace(/\/$/, '');
-      GM_setValue(SYNC_BASE_NAME, cleanBase);
+      PLATFORM.setSyncConfig(cleanBase, syncKey());
       if (!cleanBase) {
-        GM_setValue(SYNC_KEY_NAME, '');
+        PLATFORM.setSyncConfig('', '');
         pageLog('[AutoHide] Cross-device sync disabled');
         updateCount();
         return;
       }
 
-      const key = unsafeWindow.prompt('API key for ' + cleanBase + ' (sent as a Bearer token)', syncKey());
+      const key = W.prompt('API key for ' + cleanBase + ' (sent as a Bearer token)', syncKey());
       if (key === null) return;
-      GM_setValue(SYNC_KEY_NAME, key.trim());
+      PLATFORM.setSyncConfig(cleanBase, key.trim());
       syncKeyWarned = false;
       updateCount();
 
       // Prove the credentials work now rather than failing silently later.
-      const health = await gmFetch(`${cleanBase}/api/health`, 'GET', {});
+      const health = await PLATFORM.rawFetch(`${cleanBase}/api/health`, 'GET', {});
       if (!health.ok) {
-        unsafeWindow.alert(`Saved, but ${cleanBase}/api/health returned ${health.status || 'no response'}.\nCheck the URL and that the server is reachable.`);
+        W.alert(`Saved, but ${cleanBase}/api/health returned ${health.status || 'no response'}.\nCheck the URL and that the server is reachable.`);
         return;
       }
-      const probe = await gmFetch(`${cleanBase}/api/hidden?since=0&limit=1`, 'GET', syncHeaders());
+      const probe = await PLATFORM.syncFetch('/api/hidden?since=0&limit=1', 'GET');
       if (!probe.ok) {
-        unsafeWindow.alert(`Server is up but rejected the key (HTTP ${probe.status}).\nRe-run "configure sync" with the correct key.`);
+        W.alert(`Server is up but rejected the key (HTTP ${probe.status}).\nRe-run "configure sync" with the correct key.`);
         return;
       }
       await pullRemote(true);
       await pushRemote();
-      unsafeWindow.alert(`Sync connected to ${cleanBase}.\n${hiddenCount()} hidden posts known on this device.`);
+      W.alert(`Sync connected to ${cleanBase}.\n${hiddenCount()} hidden posts known on this device.`);
     });
 
-    GM_registerMenuCommand('Auto-Hide: setup link for another device', () => {
+    PLATFORM.menu('Auto-Hide: setup link for another device', () => {
       if (!syncBase() || !syncKey()) {
-        unsafeWindow.alert('Configure sync on this device first.');
+        W.alert('Configure sync on this device first.');
         return;
       }
-      const payload = unsafeWindow.btoa(`${syncBase()}|${syncKey()}`);
+      const payload = W.btoa(`${syncBase()}|${syncKey()}`);
       const link = `https://www.reddit.com/#autohide-sync=${encodeURIComponent(payload)}`;
       try {
-        GM_setClipboard(link);
-        unsafeWindow.alert('Setup link copied to the clipboard.\n\nOpen it on another device that has this script installed. It configures sync and removes itself from the URL.\n\nIt contains your key: send it privately.');
+        PLATFORM.clipboard(link);
+        W.alert('Setup link copied to the clipboard.\n\nOpen it on another device that has this script installed. It configures sync and removes itself from the URL.\n\nIt contains your key: send it privately.');
       } catch (e) {
-        unsafeWindow.prompt('Open this on the other device (contains your key, send it privately):', link);
+        W.prompt('Open this on the other device (contains your key, send it privately):', link);
       }
     });
 
-    GM_registerMenuCommand('Auto-Hide: sync now', async () => {
+    PLATFORM.menu('Auto-Hide: sync now', async () => {
       await pushRemote();
       await pullRemote(true);
       await drainRedditQueue();
-      unsafeWindow.alert(`Auto-Hide sync done.\n${hiddenCount()} hidden, ${idsNeeding('remote').length} still queued for the sync server.`);
+      W.alert(`Auto-Hide sync done.\n${hiddenCount()} hidden, ${idsNeeding('remote').length} still queued for the sync server.`);
     });
 
-    GM_registerMenuCommand('Auto-Hide: status', () => {
+    PLATFORM.menu('Auto-Hide: status', () => {
       const msg = [
         `Hidden posts: ${hiddenCount()}`,
         `Queued for sync server: ${idsNeeding('remote').length} adds, ${pendingTombIds().length} removes`,
@@ -993,18 +1119,18 @@
         `Last pull cursor: ${ledger.lastPull ? new Date(ledger.lastPull).toLocaleString() : 'never'}`,
       ].join('\n');
       pageLog('[AutoHide] ' + msg.replace(/\n/g, ' | '));
-      unsafeWindow.alert(msg);
+      W.alert(msg);
     });
 
-    GM_registerMenuCommand('Auto-Hide: forget all hidden posts', async () => {
+    PLATFORM.menu('Auto-Hide: forget all hidden posts', async () => {
       const total = hiddenCount();
       if (!total) return;
-      if (!unsafeWindow.confirm(`Unhide all ${total} posts on every device? This also clears them from the sync server.`)) return;
+      if (!W.confirm(`Unhide all ${total} posts on every device? This also clears them from the sync server.`)) return;
       for (const id of Object.keys(ledger.hidden)) recordUnhidden(id);
       saveLedgerNow();
       refreshVisuals();
       if (syncEnabled()) {
-        const resp = await gmFetch(`${syncBase()}/api/hidden`, 'DELETE', syncHeaders(), JSON.stringify({ all: true }));
+        const resp = await PLATFORM.syncFetch('/api/hidden', 'DELETE', JSON.stringify({ all: true }));
         if (resp.ok) {
           ledger.tombs = {};
           saveLedgerNow();
@@ -1034,8 +1160,10 @@
       path.startsWith('/rising');
   }
 
-  function init() {
-    ledger = loadLedger();
+  async function init() {
+    await PLATFORM.init();
+    enabled = (await PLATFORM.storeGet('autoHideEnabled', true)) !== false;
+    ledger = await loadLedger();
     registerMenu();
     consumeSyncLink();
 
@@ -1079,9 +1207,10 @@
     navObserver.observe(document.body, { childList: true, subtree: true });
   }
 
+  const boot = () => init().catch((e) => pageWarn('[AutoHide] init failed: ' + e.message));
   if (document.readyState === 'complete') {
-    init();
+    boot();
   } else {
-    window.addEventListener('load', init);
+    window.addEventListener('load', boot);
   }
 })();

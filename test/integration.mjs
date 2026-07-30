@@ -78,6 +78,28 @@ const FIXTURE_URL = `http://127.0.0.1:${httpServer.address().port}/`;
  * Playwright's exposeFunction is always async. So the store is inlined into the
  * init script at page-open time and written back through an async binding.
  */
+/**
+ * Extension mode: no GM_* at all. Instead, stand up the same postMessage bridge
+ * content-loader.js relays, backed by the same allowlist logic the service worker
+ * applies. This is what proves the ported module works where MAIN world has no
+ * chrome.* APIs and the page CSP blocks its fetches.
+ */
+function hubShimSource() {
+  return `
+    (() => {
+      const REQ = "autohub-bridge-request";
+      const RES = "autohub-bridge-response";
+      window.addEventListener("message", async (event) => {
+        if (event.source !== window) return;
+        const m = event.data;
+        if (!m || m.__autohub !== REQ || typeof m.id !== "string") return;
+        const result = await __bridge({ op: m.op, args: m.args });
+        window.postMessage({ __autohub: RES, id: m.id, result }, location.origin);
+      });
+    })();
+  `;
+}
+
 function gmShimSource(initialStoreJson) {
   return `
     (() => {
@@ -105,7 +127,7 @@ function gmShimSource(initialStoreJson) {
 }
 
 /** A fresh page whose storage comes from `storePath`: i.e. a page load, not a new device. */
-async function openPage(browser, storePath, label) {
+async function openPage(browser, storePath, label, mode = 'tm') {
   if (!existsSync(storePath)) writeFileSync(storePath, '{}');
   const context = await browser.newContext({ viewport: { width: 1100, height: 800 } });
   const page = await context.newPage();
@@ -114,6 +136,42 @@ async function openPage(browser, storePath, label) {
   await page.exposeFunction('__gmFetch', async ({ url, method, headers, data }) => {
     const resp = await fetch(url, { method, headers, body: data });
     return { status: resp.status, body: await resp.text() };
+  });
+
+  // Mirrors background.js handleBridge: same ops, same allowlists, credential held
+  // on this side so the page never sees it.
+  await page.exposeFunction('__bridge', async ({ op, args }) => {
+    const a = args || {};
+    const store = () => JSON.parse(readFileSync(storePath, 'utf-8'));
+    if (op === 'storageGet') {
+      const v = store()[`bridge:${a.key}`];
+      return { ok: true, value: v == null ? null : v };
+    }
+    if (op === 'storageSet') {
+      if (typeof a.value !== 'string') return { ok: false, error: 'value must be a string' };
+      const s2 = store();
+      s2[`bridge:${a.key}`] = a.value;
+      writeFileSync(storePath, JSON.stringify(s2));
+      return { ok: true };
+    }
+    if (op === 'fetch') {
+      if (a.service === 'reddit-hide') {
+        if (!/^\/api\/(hidden(\?.*)?|health|stats)$/.test(a.path)) return { ok: false, error: `path ${a.path} not allowed` };
+        const resp = await fetch(SYNC_BASE + a.path, {
+          method: a.method || 'GET',
+          headers: { Authorization: `Bearer ${SYNC_KEY}`, 'Content-Type': 'application/json' },
+          body: a.method === 'GET' ? undefined : a.body,
+        });
+        return { ok: resp.ok, status: resp.status, body: await resp.text() };
+      }
+      if (a.service === 'reddit-api') {
+        // Not reachable from the fixture (no Reddit token), but assert the contract.
+        if (!a.authorization) return { ok: false, error: 'authorization required' };
+        return { ok: false, status: 0, error: 'reddit api not exercised in fixture' };
+      }
+      return { ok: false, error: 'unknown service' };
+    }
+    return { ok: false, error: `unknown bridge op: ${op}` };
   });
 
   page.on('console', (m) => {
@@ -125,7 +183,9 @@ async function openPage(browser, storePath, label) {
   // Only the GM shim goes in at document-start; the userscript declares
   // @run-at document-idle, so injecting it earlier would break GM_addStyle and
   // test a timing the real thing never sees.
-  await page.addInitScript({ content: gmShimSource(readFileSync(storePath, 'utf-8')) });
+  await page.addInitScript({
+    content: mode === 'hub' ? hubShimSource() : gmShimSource(readFileSync(storePath, 'utf-8')),
+  });
   await page.goto(FIXTURE_URL, { waitUntil: 'load' });
   await page.evaluate(USERSCRIPT);
   return { context, page };
@@ -137,8 +197,9 @@ function seedStore(storePath, base, key) {
 
 function ledgerIdsFrom(storePath) {
   const store = JSON.parse(readFileSync(storePath, 'utf-8'));
-  if (!store.ledgerV3) return [];
-  return Object.keys(JSON.parse(store.ledgerV3).hidden || {});
+  const raw = store.ledgerV3 || store['bridge:ledgerV3'];
+  if (!raw) return [];
+  return Object.keys(JSON.parse(raw).hidden || {});
 }
 
 async function scrollThroughFeed(page) {
@@ -256,6 +317,61 @@ try {
   check('A did not re-push the unhidden ids',
     resurrected.length === 0,
     `resurrected: ${resurrected.slice(0, 3).join(', ')}`);
+  // ---------------------------------------------------------------
+  // Extension path: no GM_* exists, so the module must run entirely over the
+  // bridge. This is the configuration that has to work on desktop.
+  console.log('\n6. Automation Hub path (no GM_*, bridge only)');
+  const storeH = join(tmpdir(), `ah-device-hub-${stamp}.json`);
+  writeFileSync(storeH, '{}');
+  let h = null;
+  try {
+    h = await openPage(browser, storeH, 'HUB', 'hub');
+    await h.page.waitForTimeout(1500);
+
+    check('module ran with no GM_* present', (await h.page.locator('#auto-hide-toggle').count()) === 1);
+    const owner = await h.page.evaluate(() => window.__redditAutoHideOwner);
+    check(`it identifies itself as the extension platform (${owner})`, owner === 'automation-hub');
+
+    await scrollThroughFeed(h.page);
+    const hubFaded = await h.page.locator('shreddit-post.ah-faded').count();
+    check(`hid posts on scroll (${hubFaded})`, hubFaded > 0);
+
+    const hubLedger = ledgerIdsFrom(storeH);
+    check(`ledger persisted through the bridge (${hubLedger.length} ids)`, hubLedger.length > 0);
+
+    await h.page.waitForTimeout(3500);
+    const onServerHub = await serverIds();
+    const missingHub = hubLedger.filter((id) => !onServerHub.has(id));
+    check(`server received all ${hubLedger.length} ids via the service worker`,
+      hubLedger.length > 0 && missingHub.length === 0,
+      `missing: ${missingHub.slice(0, 3).join(', ')}`);
+
+    // The regression check again, on this platform.
+    await h.context.close();
+    h = await openPage(browser, storeH, 'HUB', 'hub');
+    await h.page.waitForTimeout(2500);
+    const hubCollapsed = await h.page.$$eval('shreddit-post.ah-collapsed', (els) => els.map((e) => e.id));
+    const notHidden = hubLedger.filter((id) => !hubCollapsed.includes(id));
+    check(`all ${hubLedger.length} stayed hidden across a reload`,
+      hubLedger.length > 0 && notHidden.length === 0,
+      `visible again: ${notHidden.slice(0, 3).join(', ')}`);
+
+    // Second instance on the same page must stand down, not double up.
+    await h.page.evaluate(USERSCRIPT);
+    await h.page.waitForTimeout(300);
+    const toolbars = await h.page.locator('#auto-hide-toggle').count();
+    check('a second instance stands down instead of duplicating the UI', toolbars === 1,
+      `found ${toolbars} toolbars`);
+
+    await fetch(`${SYNC_BASE}/api/hidden`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${SYNC_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: hubLedger }),
+    }).catch(() => {});
+  } finally {
+    if (h) await h.context.close().catch(() => {});
+    rmSync(storeH, { force: true });
+  }
 } finally {
   if (a) await a.context.close().catch(() => {});
   if (b) await b.context.close().catch(() => {});
